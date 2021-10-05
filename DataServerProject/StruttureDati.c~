@@ -1,0 +1,26 @@
+
+//il nodo della lista generico
+typedef struct ln{
+	void* el;
+	struct ln* next;
+	struct ln* prec;
+} listNode;
+//il tipo lista su cui applicare i metodi implementati
+typedef struct l{
+	listNode * head;
+	listNode * tail;
+	int elTot;
+	politic pol;
+	} list;
+//enumerazione
+typedef enum p{
+	LIFO = 0;
+	FIFO = 1;} politic;
+	
+	
+//crea una lista, allocandola nello heap, 
+list* createList(politic pol){
+	list* dummy = malloc(sizeof(list));
+	&dummy = {NULL, NULL, 0, pol};
+	return dummy;
+} 

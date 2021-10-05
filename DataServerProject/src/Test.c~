@@ -1,0 +1,52 @@
+#include "StruttureDati.h"
+
+int compareInt(void* a, void*b){return *((int*)(a))  == *((int*)(b));}
+
+int main(){
+    int * dummy;
+    list* l = NULL;
+    
+    
+    
+    l = createList(compareInt);
+    
+    
+    printList(l);
+    
+    
+    int i;
+	
+	printList(l);
+	
+    for(i = 0; i<100; i++){
+    	dummy = malloc(sizeof(int));
+        *dummy = i*4;
+        if(i%2) {
+            addHead(l, dummy);
+        }
+        else{
+            addTail(l, dummy);
+        }
+
+    }
+    
+    printList(l);
+    
+    removeFirst(l);
+    removeLast(l);
+    removeFirst(l);
+    removeLast(l);
+    removeFirst(l);
+    removeLast(l);
+    
+    printList(l);
+    
+    for(i = 0; i<100; i+=8){
+    	removeEl(l,&i );
+
+    }
+    
+    freeAll(l);
+    return 0;
+}
+

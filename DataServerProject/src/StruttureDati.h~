@@ -1,0 +1,19 @@
+#ifndef LIB_STRUTTUREDATI_H
+#define LIB_STRUTTUREDATI_H
+
+#include <stdlib.h>
+#include <stdio.h>
+#include "StruttureDati.h"
+
+
+
+list* createList();
+int addHead(list* l, void* el);
+int addTail(list* l, void* el);
+void* removeFirst(list* l);
+void* removeLast(list* l);
+void* removeEl(list* l, void* el);
+int freeAll(list* l);
+void printList(list* l);
+
+#endif //LIB_STRUTTUREDATI_H
