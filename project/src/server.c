@@ -3,16 +3,20 @@
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
+#include <assert.h>
 
 #define MAXFILENAMELENGHT 108 //lunghezza massima dei path dei file
-#define MSG_SIZE 1024   // dimensione di alcuni messaggi scambiati tra server e API
-#define MAXTEXTLENGHT 1024 // grandezza massima del contenuto di un file: 1 KB
+#define STANDARDMSGSIZE 1024   // dimensione messaggio standard tra api e server
+#define SMALLMSGSIZE 128 // dimensione messaggio small tra api e server
+#define MAXTEXTLENGHT 1048576 // grandezza massima del contenuto di un file: 1 MB
 #define SOCKET_NAME "./ssocket.sk"  // nome di default per il socket
-#define LOG_NAME "./log.txt"    // nome di default per il file di log
 
-//gestione errore semplificata
+//gestione errore semplificata e non solo
 #define GESTERRP(a, b) if((a) == NULL){b}
 #define GESTERRI(a, b) if((a)){b}
 #define AGGMAX(a, b) if((a) > (b)) (b) = (a);
@@ -43,7 +47,6 @@ static long long hashFun(char* s, size_t N){
     long long ret = valore % N;
     return ret;
 }
-
 //struct per lista di client
 typedef struct sn {
     size_t clientId;//descrittore client
@@ -90,26 +93,35 @@ typedef struct sh {
 } hash;
 
 //VARIABILI GLOBALI
-//* 0 -> FIFO
-//* 1 -> LRU
-
+/*
+ * 0 -> FIFO
+ * 1 -> LRU
+*/
 static int politic = 0;
+
+FILE *logF; // puntatore al file di log
+pthread_mutex_t logMutex = PTHREAD_MUTEX_INITIALIZER; // mutex per mutua esclusione sul file di log
 
 static size_t maxStorageSize;    // dimensione massima dello storage (solo il contenuto dei file)
 static size_t maxNFile;      // numero massimo di files nello storage
 
 static size_t nThread;    // numero di thread worker del server
 
-static hash *storage = NULL;    // tabella hash in cui saranno raccolti i files del server
+static hash *storage = NULL;// tabella hash in cui saranno raccolti i files del server
 //non necessita di una mutex
 
-static priorityList* priorityQ = NULL;      //coda per la gestione della priorità di rimpiazzamento dei file
+static priorityList* priorityQ = NULL;//coda per la gestione della priorità di rimpiazzamento dei file
 pthread_mutex_t pqMutex = PTHREAD_MUTEX_INITIALIZER; // mutex coda priorityList
 //questa cosa di usa e si locka solo dentro una lock dei file, MAI il contrario
 
 static clientList* coda = NULL;     // struttura dati di tipo coda FIFO per la comunicazione Master/Worker
 pthread_mutex_t cMutex = PTHREAD_MUTEX_INITIALIZER; // mutex per mutua esclusione sugli accessi alla coda
 pthread_cond_t condCoda = PTHREAD_COND_INITIALIZER;
+
+//lock e variabile d condizione per simulare le lock sui file e per risparmiare operazioni inutili al server
+//le lock sui file rimangono solo fino a quando un client è connesso quindi l'attesa per una lock è finita e sostenibile
+pthread_mutex_t lockFileMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t lockFileCondizione = PTHREAD_COND_INITIALIZER;
 
 volatile sig_atomic_t t = 0; // gestione dei segnali, modificata dall'handler e usata nel main
 //volatile perchè è necessario
@@ -412,7 +424,7 @@ static file *createFile(char *path, char *text, size_t lockOwner) {
     GESTERRI(textLenght >= MAXTEXTLENGHT, errno = ENAMETOOLONG; return NULL;)
 
     file *dummy = malloc(sizeof(file));
-    GESTERRP(dummy, errno = ENOMEM; perror("malloc failed");return NULL;)
+    GESTERRP(dummy, errno = ENOMEM; perror("malloc failed"); return NULL;)
 
     dummy->path = malloc(sizeof(char) * MAXFILENAMELENGHT);
     GESTERRP(dummy->path, free(dummy); errno = ENOMEM;perror("malloc failed"); return NULL;)
@@ -604,14 +616,13 @@ static void printPQ (priorityList* lst)
 **/
 static int pListLRU(fPriorityNode *node) {
     safeLock(&pqMutex);
-
     GESTERRP(priorityQ, errno = EINVAL; perror("pListLRU: priorityQ = NULL"); safeUnlock(&pqMutex); return -1;)
     GESTERRP(node, errno = EINVAL;  safeUnlock(&pqMutex); return -1;)
     GESTERRP(priorityQ->head, safeUnlock(&pqMutex); return -1;)
 
-    if(priorityQ->head == node) return 1;
+    if(priorityQ->head == node){safeUnlock(&pqMutex);return 1;}
     if(priorityQ->tail == node){
-        if(priorityQ->head == node) return 1;
+        if(priorityQ->head == node){safeUnlock(&pqMutex);return 1;}
         else{
             priorityQ->tail = priorityQ->tail->prec;
             priorityQ->tail->next = NULL;
@@ -626,7 +637,6 @@ static int pListLRU(fPriorityNode *node) {
     node->next = priorityQ->head;
     priorityQ->head->prec = node;
     priorityQ->head = node;
-
     safeUnlock(&pqMutex);
     return 1;
 }
@@ -996,17 +1006,14 @@ static fileList* hashReplaceF(hash *ht, char *path, size_t clientId) {//ENOMEM e
     GESTERRP(path, errno = EINVAL; return NULL;)
     GESTERRI(clientId == 0, errno = EINVAL; return NULL;)
 
-    printPQ(priorityQ);
-
     //lista restituita
     fileList *retList = createFileList();
     GESTERRP(retList, return NULL;)// errno è settato da create list se serve
 
-
     lockAllH(ht);//serve così posso usare liberamente la priorityQ senza aver paura di sbagli
-    safeLock(&sMutex);
 
     int successo = 0; //l'algoritmo non apporta modifiche ogni volta che è  stato attivato
+    safeLock(&sMutex);
     if(currentStorageSize > maxStorageSize) successo = 1;
 
     fPriorityNode *target = NULL; //punatatore al nodo della coda priorityList che conterrà il path del file potenzialmente rimpiazzabile
@@ -1014,9 +1021,9 @@ static fileList* hashReplaceF(hash *ht, char *path, size_t clientId) {//ENOMEM e
 
     //se serve l'algoitmo rimpiazza più di un file
     while (currentStorageSize > maxStorageSize) {
-
-        GESTERRP(target, errno = EFBIG; safeUnlock(&sMutex); unlockAllH(ht); hashTableRemovePath(ht, path); return retList;)
-
+        safeUnlock(&sMutex);
+        GESTERRP(target,
+                  safeUnlock(&sMutex); unlockAllH(ht); fileListAddH(retList, hashTableRemovePath(ht, path));errno = EFBIG; return retList;)
         file *toRemove = hashTableGetFile(storage, target->path);
         // troviamo il file corrispondente al path scelto
         GESTERRP(toRemove, errno = ENOTRECOVERABLE; freeFileList(retList); safeUnlock(&sMutex);unlockAllH(ht); perror("errore sincronizzazione PQ e hashTable"); return NULL;)
@@ -1024,16 +1031,14 @@ static fileList* hashReplaceF(hash *ht, char *path, size_t clientId) {//ENOMEM e
         //il file da eliminare non deve essere lockato da nessuno se non da chi ha fatto aviare la replace, e non deve essere
         //il file che ha generato il bisogno di avviare la replace
         while ((toRemove->lockOwner != 0 && toRemove->lockOwner != clientId) ||
-                (target->path == path)) {
-
+                (!strcmp(target->path, path))) {
             target = target->prec;
-            GESTERRP(target, errno = EFBIG; safeUnlock(&sMutex); unlockAllH(ht); hashTableRemovePath(ht, path); return retList;)
+            GESTERRP(target,  safeUnlock(&sMutex); unlockAllH(ht); fileListAddH(retList, hashTableRemovePath(ht, path));errno = EFBIG;return retList;)
             //il file non viene inserito, ma altri sono stati tolti
 
             toRemove = hashTableGetFile(storage, target->path);
             GESTERRP(toRemove, errno = ENOTRECOVERABLE; freeFileList(retList);safeUnlock(&sMutex); unlockAllH(ht); perror("errore sincronizzazione PQ e hashTable"); return NULL;)
         }
-
         target = target->prec;//bisogna aggiornare il puntatore prima di chiamare la remove (che elimina il path dalla pq)
 
         file *copy = hashTableRemovePath(storage, toRemove->path);
@@ -1043,17 +1048,17 @@ static fileList* hashReplaceF(hash *ht, char *path, size_t clientId) {//ENOMEM e
 
         GESTERRI(fileListAddH(retList, copy) == -1, freeFileList(retList); safeUnlock(&sMutex);unlockAllH(ht); return NULL;)
 
+        safeLock(&sMutex);
         replaceSucc++;   //un file tolto dalla replace
     }
-
     //aggiornamento statistiche
     if (successo == 1) replaceAtt++;
     AGGMAX(currentStorageSize, maxStorageSizeReach)
-
+    safeUnlock(&sMutex);
 
     //fine senza errori
-    safeUnlock(&sMutex);
     unlockAllH(ht);
+    errno = 0;
     return retList;
 }
 
@@ -1078,6 +1083,7 @@ static void hashResetLock(hash *ht, size_t clientId) {
         }
         safeUnlock(&(ht->lists[i]->mtx));
     }
+    pthread_cond_broadcast(&lockFileCondizione);//consizione per ritentare la lockFile
 }
 
 //    FUNZIONI PER IL SERVER   //
@@ -1137,6 +1143,7 @@ int readn(long fd, void *buf, size_t size) {
  *   @brief Funzione che permette di effettuare la write completandola correttamente nonostante una ricezione di un segnale
  *   @param fd descrittore della connessione
  *   @param buf puntatore al messaggio da inviare
+ *   @param size numero di dati da scivere in bytes
  *   @return Il numero di bytes scritti, -1 se genera errore
  */
 int writen(long fd, const void *buf, size_t size) {
@@ -1277,7 +1284,7 @@ static int openFile(char *path, int flags, size_t clientId) {
             GESTERRI(canBeAdded == 0,errno = ENFILE; safeUnlock(&(dummyL->mtx)); return -1;)//non permesso
 
             file *dummyF = createFile(path, "", 0);
-            GESTERRP(dummyF, safeUnlock(&(dummyL->mtx)); perror("openFile"); return -1;)
+            GESTERRP(dummyF, safeUnlock(&(dummyL->mtx)); return -1;)//path troppo lungo, errore settato prima
 
 
             if (clientListAddH(dummyF->openerList, clientId) == -1){
@@ -1336,7 +1343,6 @@ static int openFile(char *path, int flags, size_t clientId) {
         }
     }
 }
-
 /**
  *   @brief comportamento conforme alla funzione della api
  *   @param path il path del file da leggere
@@ -1346,7 +1352,7 @@ static int openFile(char *path, int flags, size_t clientId) {
  *   @return 0 se l'operazione va a buon fine, 0 se fallisce
 */
 //il buffer viene inizializzato dentro
-static int readFile(char *path, char *buf, size_t *size, size_t clientId) {
+static int readFile(char *path, char **buf, size_t *size, size_t clientId) {
 
     GESTERRP(path, errno = EINVAL; return -1;)
 
@@ -1364,8 +1370,10 @@ static int readFile(char *path, char *buf, size_t *size, size_t clientId) {
             //se il client ha aperto il file e esso non è locked
             *size = strlen(dummyF->text);
 
-            buf = malloc( (int) (sizeof(char) * (*size)));
-            strcpy(buf, dummyF->text);
+            *buf = malloc( sizeof(char) * ( (*size)+1 )  );
+            strncpy(*buf, dummyF->text, ((*size) + 1));
+            
+            
 
             safeLock(&sMutex);
             readSucc++;
@@ -1375,6 +1383,7 @@ static int readFile(char *path, char *buf, size_t *size, size_t clientId) {
             safeUnlock(&dummyL->mtx);
 
             POLITIC(dummyF->fPointer)
+           
 
             return 0;
         } else {
@@ -1389,6 +1398,8 @@ static int readFile(char *path, char *buf, size_t *size, size_t clientId) {
         return -1;
     }
 }
+}
+
 /**
  *   @brief comportamento conforme alla funzione della api
  *   @param path il path del file in cui scrivere
@@ -1399,14 +1410,12 @@ static int readFile(char *path, char *buf, size_t *size, size_t clientId) {
 static fileList *writeFile(char *path, char *text, size_t clientId) {
     GESTERRP(path, errno= EINVAL; return NULL;)
     GESTERRP(text, errno = EINVAL; return NULL;)
-
     fileList *dummyL = hashTableGetFList(storage, path);
     GESTERRP(dummyL, errno = ENOTRECOVERABLE; perror("writeFile");  return NULL;)//errori che non dovrebbero accadere
 
     safeLock(&(dummyL->mtx));
-
     file *dummyF = hashTableGetFile(storage, path);
-    GESTERRP(dummyF, errno = ENOTRECOVERABLE; perror("writeFile"); return NULL;)
+    GESTERRP(dummyF, safeUnlock(&(dummyL->mtx)); errno = ENOENT; return NULL;)
 
     if(clientListContains(dummyF->openerList, clientId) == 1){
         if (dummyF->lockOwner == 0 || dummyF->lockOwner != clientId) {
@@ -1416,7 +1425,7 @@ static fileList *writeFile(char *path, char *text, size_t clientId) {
         }
         else{
             size_t lenCurr = strnlen(text, MAXTEXTLENGHT);
-            GESTERRI(lenCurr >= MAXTEXTLENGHT, errno = EFBIG; safeUnlock(&(dummyL->mtx)); return NULL;)//file?? boh
+            GESTERRI(lenCurr >= MAXTEXTLENGHT,  safeUnlock(&(dummyL->mtx)); errno = EFBIG; return NULL;)//file?? boh
 
             size_t lenPrec = strlen(dummyF->text);
             free(dummyF->text);
@@ -1434,7 +1443,10 @@ static fileList *writeFile(char *path, char *text, size_t clientId) {
             safeUnlock(&(dummyL->mtx));
             POLITIC(dummyF->fPointer)
             fileList *out = hashReplaceF(storage, path, clientId);
+            int errnoV = errno;
+            pthread_cond_broadcast(&lockFileCondizione);//consizione per ritentare la lockFile
 
+            errno = errnoV;
             return out;
         }
     }
@@ -1461,7 +1473,7 @@ static fileList *appendToFile(char *path, char *text, size_t clientId) {
     safeLock(&(dummyL->mtx));
 
     file *dummyF = hashTableGetFile(storage, path);
-    GESTERRP(dummyF, errno = ENOTRECOVERABLE; perror("appendFile"); return NULL;)
+    GESTERRP(dummyF, safeUnlock(&(dummyL->mtx)); errno = ENOENT; return NULL;)
 
     if(clientListContains(dummyF->openerList, clientId) == 1){
         if (dummyF->lockOwner == 0 || dummyF->lockOwner != clientId) {
@@ -1490,6 +1502,8 @@ static fileList *appendToFile(char *path, char *text, size_t clientId) {
             safeUnlock(&(dummyL->mtx));
             POLITIC(dummyF->fPointer);
             fileList *out = hashReplaceF(storage, path, clientId);
+
+            pthread_cond_broadcast(&lockFileCondizione);//consizione per ritentare la lockFile
 
             return out;
         }
@@ -1528,48 +1542,9 @@ static int lockFile(char *path, size_t clientId) {
             return 0;
         }
         else{
+        	errno = ENOLCK;
             safeUnlock(&(dummyL->mtx));
             return -2; // valore speciale, quando sarà ricevuto dalla do a job verrà fatta una wait
-        }
-    }
-    else{
-        safeUnlock(&(dummyL->mtx));
-        errno = ENOENT;
-        return -1;
-    }
-}
-/**
- *   @brief comportamento conforme alla funzione della api
- *   @param path il path del file di cui eseguire la unlock
- *   @param clientId l'id del client che richiede l'operazione
- *   @return 0 se termina correttamente, -1 se fallisce
-*/
-static int closeFile(char *path, size_t clientId) {
-    GESTERRP(path, errno = EINVAL; return -1;)
-
-    fileList *dummyL = hashTableGetFList(storage, path);
-    GESTERRP(dummyL, errno = ENOTRECOVERABLE; perror("closeFile");  return -1;)//errori che non dovrebbero accadere
-    safeLock(&(dummyL->mtx));
-
-    if(hashContains(storage, path) == 1){
-        file *dummyF = hashTableGetFile(storage, path);
-
-        if( clientListContains(dummyF->openerList, clientId) == 1 &&
-            (dummyF->lockOwner == clientId || dummyF->lockOwner == 0)){
-
-            GESTERRI(clientListRemove(dummyF->openerList, clientId) != 1, errno = ENOTRECOVERABLE; perror("closeFile");  return -1;)
-            safeLock(&sMutex);
-            closeSucc++;
-            safeUnlock(&sMutex);
-
-            safeUnlock(&(dummyL->mtx));
-            POLITIC(dummyF->fPointer)
-            return 0;
-        }
-        else{
-            safeUnlock(&(dummyL->mtx));
-            errno = EPERM;
-            return -1;
         }
     }
     else{
@@ -1602,6 +1577,49 @@ static int unlockFile(char *path, size_t clientId) {
             safeUnlock(&sMutex);
 
             safeUnlock(&(dummyL->mtx));
+
+            POLITIC(dummyF->fPointer)
+
+            pthread_cond_broadcast(&lockFileCondizione);//consizione per ritentare la lockFile
+            return 0;
+        }
+        else{
+            safeUnlock(&(dummyL->mtx));
+            errno = EPERM;
+            return -1;
+        }
+    }
+    else{
+        safeUnlock(&(dummyL->mtx));
+        errno = ENOENT;
+        return -1;
+    }
+}
+/**
+ *   @brief comportamento conforme alla funzione della api
+ *   @param path il path del file di cui eseguire la unlock
+ *   @param clientId l'id del client che richiede l'operazione
+ *   @return 0 se termina correttamente, -1 se fallisce
+*/
+static int closeFile(char *path, size_t clientId) {
+    GESTERRP(path, errno = EINVAL; return -1;)
+
+    fileList *dummyL = hashTableGetFList(storage, path);
+    GESTERRP(dummyL, errno = ENOTRECOVERABLE; perror("closeFile");  return -1;)//errori che non dovrebbero accadere
+    safeLock(&(dummyL->mtx));
+
+    if(hashContains(storage, path) == 1){
+        file *dummyF = hashTableGetFile(storage, path);
+
+        if( clientListContains(dummyF->openerList, clientId) == 1 &&
+                (dummyF->lockOwner == clientId || dummyF->lockOwner == 0)){
+
+            GESTERRI(clientListRemove(dummyF->openerList, clientId) != 1, errno = ENOTRECOVERABLE; perror("closeFile");  return -1;)
+            safeLock(&sMutex);
+            closeSucc++;
+            safeUnlock(&sMutex);
+
+            safeUnlock(&(dummyL->mtx));
             POLITIC(dummyF->fPointer)
             return 0;
         }
@@ -1617,7 +1635,6 @@ static int unlockFile(char *path, size_t clientId) {
         return -1;
     }
 }
-
 /**
  *   @brief comportamento conforme alla funzione della api
  *   @param path il path del file di cui eseguire la unlock
@@ -1639,6 +1656,8 @@ static int removeFile(char *path, size_t clientId) {
             freeFile(hashTableRemovePath(storage, path));
 
             safeUnlock(&(dummyL->mtx));
+
+            pthread_cond_broadcast(&lockFileCondizione);//consizione per ritentare la lockFile
             return 0;
         }
         else{
@@ -1653,9 +1672,392 @@ static int removeFile(char *path, size_t clientId) {
         return -1;
     }
 }
+static int sendNFile(fileList *fl, int clientId, int pipePF, int *endFlag){
 
-/*int main(){
-    storage = createHash(2);
+    file* curr = fl->head;
+    char out[STANDARDMSGSIZE];
+    int textLen;
+
+    while(curr != NULL){
+
+        textLen = strlen(curr->text) + 1;
+        sprintf(out, "%s;%d;", curr->path, textLen);
+
+        if (writen(clientId, out, STANDARDMSGSIZE) == -1) {//path + sizeText
+            perror("executeTask:removeFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+            return -1;
+        }
+        if (writen(clientId, curr->text, textLen) == -1) {//contenuto file
+            perror("executeTask:removeFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+            return -1;
+        }
+
+        curr = curr->next;
+    }
+    return 0;
+}
+static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
+    GESTERRP(task, errno = EINVAL; return;)
+    GESTERRI(clientId < 1, errno = EINVAL; return;)
+    GESTERRI(pipeFD < 1, errno = EINVAL; return;)
+
+    char out[SMALLMSGSIZE];
+    memset(out, 0, SMALLMSGSIZE);
+    char *token = NULL;
+    char *save = NULL;
+
+    int ret;//valore di ritorno da mandare al client
+    int errnoValue;// errno per il log
+
+    token = strtok_r(task, ";", &save);//tokenizzazione stringa che contiene la task, primo token = tipo di op
+    //se token == NULL allora la richiesta è di disconnessione
+
+    //openfile
+    if (strcmp(token, "3") == 0) {
+        //3;flags;pathname;
+
+        //flags
+        token = strtok_r(NULL, ";", &save);
+        int flags = (int) strtol(token, NULL, 10);
+
+        token = strtok_r(NULL, ";", &save);//il terminatore c'è per forza, se troppo lungo genera errore in seguito
+        //path
+
+        ret = openFile(token, flags, clientId);
+        errnoValue = errno;
+
+        if (ret == -1) sprintf(out, "-1;%d;", errno);
+        else sprintf(out, "0;");
+
+        if (writen(clientId, out, SMALLMSGSIZE) == -1) {//comunicazione con il client
+            perror("executeTask:openFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:openFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:openFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+
+        int o_create; int o_lock;//flag
+        switch(flags){
+            case 0: o_create = 0;
+                    o_lock = 0;
+                    break;
+            case 1: o_create = 0;
+                    o_lock = 1;
+                break;
+            case 2: o_create = 1;
+                    o_lock = 0;
+                break;
+            case 3: o_create = 1;
+                    o_lock = 1;
+                break;
+            default : errno = ENOTRECOVERABLE; perror("executeTask:openFile"); exit(EXIT_FAILURE); break;//??
+        }
+
+        //log
+        //[ThreadID]<3/ret/errno/O_CREATE/O_LOCK/"filePath">
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<3/%d/%d/%d|%d/\"%s\">\n", pthread_self(), ret, errnoValue, o_create, o_lock, token);
+        safeUnlock(&logMutex);
+    }
+    //closeFile
+    else if (strcmp(token, "10") == 0) {
+        //10;pathname;
+
+        token = strtok_r(NULL, ";", &save);
+
+        ret = closeFile(token, clientId);
+        errnoValue = errno;
+
+        if (ret == -1) sprintf(out, "-1;%d;", errno);
+        else sprintf(out, "0;");
+
+        if (writen(clientId, out, STANDARDMSGSIZE) == -1) {
+            perror("executeTask:closeFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:closeFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:closeFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+
+        //log
+        //[ThreadID]<10/ret/errno/"filePath">
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<10/%d/%d/\"%s\">\n", pthread_self(), ret, errnoValue, token);
+        safeUnlock(&logMutex);
+    }
+    //lockFile
+    else if (strcmp(token, "8") == 0) {
+        //8;pathname;
+
+        token = strtok_r(NULL, ";", &save);
+        ret = -2;
+
+        safeLock(&lockFileMutex);
+        ret = lockFile(path, clientId);
+        errnoValue = errno;
+        while (ret == -2){
+            //il thread attende un segnale che viene mandato quando un client esegue una unlock su un file, o elimina un file
+            pthread_cond_wait(&lockFileCondizione, &lockFileMutex);
+            ret = lockFile(token, clientId);
+            errnoValue = errno;
+        }
+        safeUnlock(&lockFileMutex);
+
+        if (ret == -1) sprintf(out, "-1;%d;", errno);
+        else sprintf(out, "0;");
+
+        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
+            perror("executeTask:lockFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:lockFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:lockFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+
+        //log
+        //[Thrd_id]<8/ret/errno/"filePath">
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<8/%d/%d/\"%s\">\n", pthread_self(),ret,errnoValue, token);
+        safeUnlock(&logMutex);
+    }
+    //unlockFile
+    else if (strcmp(token, "9") == 0) {
+        //9;pathname;
+
+        // tokenizzazione degli argomenti
+        token = strtok_r(NULL, ";", &save);
+
+        // esecuzione della richiesta
+        ret = unlockFile(path, clientId);
+        errnoValue = errno;
+
+        if (ret == -1) sprintf(out, "-1;%d;", errno);
+        else sprintf(out, "0;");
+
+        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:unlockFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:unlockFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+
+        //log
+        //[Thrd_id]<9/ret/errno/"filePath">
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<9/%d/%d/%s>\n", pthread_self(), ret, errnoValue, path);
+        safeUnlock(&logMutex);
+    }
+    //removeFile
+    else if (strcmp(token, "11") == 0) {
+        //11;pathname;
+
+        token = strtok_r(NULL, ";", &save);
+
+        // esecuzione della richiesta
+        ret = removeFile(path, clientId);
+        errnoValue = errno;
+
+        if (ret == -1) sprintf(out, "-1;%d;", errno);
+        else sprintf(out, "0;");
+
+
+        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
+            perror("executeTask:removeFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+
+        //log
+        //[Thrd_id]<11/ret/errno/"filePath">
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<11/%d/%d/\"%s\">\n", pthread_self(), ret, errnoValue, path);
+        safeUnlock(&logMutex);
+    }
+    //writeFile
+    else if (strcmp(token, "6") == 0) {
+        //6;pathname;sizeText;
+        //prossimo messagio: text;
+
+        //pathname
+        char path[MAXFILENAMELENGHT];
+        path = strtok_r(NULL, ";", &save);
+
+        //dim testo (con terminatore)
+        size_t sizeText;
+        token = strtok_r(NULL, ";", &save);
+        sizeText = (size_lu) strtol(token, NULL, 10);
+
+        char text[sizeText];
+
+        if (readn(clientId, text, sizeText) == -1) {
+            errno = EIO;
+            perror("executeTask:writeFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:writeFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:writeFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+        text[sizeText - 1] = '\0';
+
+        // esecuzione della richiesta
+        fileList *dummyFileList = writeFile(path, text, clientId);
+        errnoValue = errno;
+        size_t listSize = 0;
+        if(dummyFileList != NULL) listSize = dummyFileList->size;
+        if (errnoValue != 0){
+            ret = -1;
+            sprintf(out, "-1;%d;%lu;", errno, listSize);
+        }
+        else {
+            ret = 0;
+            sprintf(out, "0;%lu;", listSize);
+        }
+
+        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
+            perror("executeTask:writeFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:writeFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:writeFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+
+        if(listSize != 0)
+            GESTERRI(sendNFIle(dummyFileList, clientId, pipeFD, endFlag) == -1, freeFileList(dummyFileList);return;)//errore invio messaggi
+
+        //log
+        //[Thrd_id]<6/ret/errno/"filePath"/listSize>
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<6/%d/%d/\"%s\"/%lu>\n", pthread_self(), ret,errnoValue, path, listSize);
+        safeUnlock(&logMutex);
+        freeFileList(dummyFileList);
+    }
+
+    //da far
+    else if (strcmp(token, "7") == 0) {
+    }
+    else if (strcmp(token, "4") == 0) {
+    }
+    else if (strcmp(token, "5") == 0) {
+    }
+
+
+    else if (strcmp(token, "2") == 0) {//disconnect
+        hashResetLock(storage, clientId);
+
+        pthread_cond_broadcast(&lockFileCondizione);//consizione per ritentare la lockFile
+
+        *endFlag = 1;//disconnesso, cambiare client
+
+        GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                 errno = EPIPE; perror("executeTask"); exit(EXIT_FAILURE);)
+        GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                 errno = EPIPE; perror("executeTask"); exit(EXIT_FAILURE);)
+    }
+    else {
+        //funzione non implementata
+        sprintf(out, "-1;%d", ENOSYS);
+
+        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
+            perror("executeTask:writeFile");
+            *endFlag = 1;
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:default"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:default"); exit(EXIT_FAILURE);)
+            return;
+        }
+    }
+}
+
+static void *w_routine(void *arg) {
+    int fd_pipe = *((int *) arg);
+    int fd_c;
+
+    while (1) {
+        int end = 0; //valore indicante la terminazione del client
+
+        //un client viene espulso dalla coda secondo la politica priorityList
+        fd_c = clientListPop(coda);
+
+        if (fd_c == -2) return (void *) -1;
+        if (fd_c == -1) return (void *) 0;
+
+        while (end != 1) {
+            char quest[STANDARDMSGSIZE];
+            memset(quest, 0, STANDARDMSGSIZE);
+
+            //il client viene servito dal worker in ogni sua richiesta sino alla disconnessione
+            int len = readn(fd_c, quest, STANDARDMSGSIZE);
+            quest[STANDARDMSGSIZE - 1] = '\0';//legale??
+
+            //printf("\n il comando letto è : %s",quest);
+            if (len == -1) {// il client è disconnesso, il worker attenderà il prossimo
+                end = 1;//disconnesso, cambiare client
+
+                //USOPIPE
+                GESTERRI(write(fd_pipe, &fd_c, sizeof(fd_c)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                         errno = EPIPE; perror("routine"); exit(EXIT_FAILURE);)
+                GESTERRI(write(fd_pipe, &end, sizeof(end)) == -1,
+                         errno = EPIPE; perror("routine"); exit(EXIT_FAILURE);)
+            } else {// richiesta del client ricevuta correttamente
+                if (len != 0) executeTask(quest, fd_c, fd_pipe, &end);
+            }
+        }
+    }
+    return (void *) 0;
+}
+
+/*
+int main(){
+
+    storage = createHash(5);
     priorityQ = createPriorityList();
 
     int i;
@@ -1665,67 +2067,102 @@ static int removeFile(char *path, size_t clientId) {
                "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
                "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
                "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "v"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "v"
-               "v"
                "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
                "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "v"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "v"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n7"
                "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n";
 
-    printHashtable(storage);
+    char* t2 = "file_bello_bello\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
+               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n";
+
     for(i = 0; i<30; i++){
-        sprintf(f1, "File#->%d", i);
+        sprintf(f1, "File%d", i);
         file* f = createFile(f1, t1, 11);
         hashTableAdd(storage, f);
     }
-    printHashtable(storage);
     for(i = 88; i<100; i++){
-        sprintf(f1, "File#->%d", i);
+        sprintf(f1, "File%d", i);
         file* f = createFile(f1, t1, 23);
         hashTableAdd(storage, f);
     }
-    printHashtable(storage);
     for(i = 12; i<19; i++){
-        sprintf(f1, "File#->%d", i);
+        sprintf(f1, "File%d", i);
         freeFile(hashTableRemovePath(storage, f1));
     }
-    printHashtable(storage);
-    sprintf(f1, "File#->%d", 4);
-    freeFile(hashRemoveFilePath(storage, f1));
-
-    printHashTable(storage);
-    maxStorageSize = 50000;
+    sprintf(f1, "File%d", 4);
+    maxStorageSize = 150000;
     file*f = createFile(f1, t1, 11);
-    hashTableAdd(storage, f);
 
     printHashTable(storage);
 
+    printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
     fileList* c = hashReplaceF(storage, f1, (size_t) 11);
+    freeFile(f);
 
     printFileList(c);
     printHashTable(storage);
@@ -1733,5 +2170,224 @@ static int removeFile(char *path, size_t clientId) {
     freeHashTable(storage);
     freeFileList(c);
     freeFifo(priorityQ);
+
+    printf("##############FINE!################\n");
+
+    size_t j;
+    storage = createHash(7);
+    priorityQ = createPriorityList();
+
+    maxNFile = 1000;
+    maxStorageSize = 200000;
+    currentStorageSize = 0;
+    for(j = 1; j<40; j++){
+        sprintf(f1, "File%lu", j);
+        openFile(f1, (3) , (j%5) + 1);
+    }
+    for(j = 1; j<32; j++){
+        printf("##############################\n");
+        sprintf(f1, "File%lu", j);
+        printf("MODIF: %s\n", f1);
+
+        fileList* elim = writeFile(f1,t1,(j%5) + 1);
+        if(elim == NULL) perror("??");
+        else {
+            printFileList(elim);
+            freeFileList(elim);
+        }
+
+        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+        printPQ(priorityQ);
+        printHashTable(storage);
+        printf("##############################\n");
+    }
+    for(j = 25; j>=11; j--){
+        printf("##############################\n");
+        sprintf(f1, "File%lu", j);
+        printf("MODIF: %s\n", f1);
+
+        fileList* elim = appendToFile(f1,t1,(j%5) + 1);
+        if(elim == NULL) perror("??");
+        else {
+            printFileList(elim);
+            freeFileList(elim);
+        }
+
+        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+        printPQ(priorityQ);
+        printHashTable(storage);
+        printf("##############################\n");
+    }
+
+    printf("##############################\n");
+    sprintf(f1, "File%lu", 6);
+    printf("MODIF: %s\n", f1);
+
+    fileList* elim = appendToFile(f1,t2,(6%5) + 1);
+    if(elim == NULL) perror("??");
+    else {
+        printFileList(elim);
+        freeFileList(elim);
+    }
+    printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+    printPQ(priorityQ);
+    printHashTable(storage);
+    printf("##############################\n");
+
+    for(j = 16; j<32; j++){
+        printf("##############################\n");
+        sprintf(f1, "File%lu", j);
+        printf("MODIF: %s\n", f1);
+
+        int ret = unlockFile(f1,(j%5) + 1);
+        if(ret != 0) perror("??");
+
+        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+        printf("##############################\n");
+    }
+    for(j = 10; j<20; j++){
+        printf("##############################\n");
+        sprintf(f1, "File%lu", j);
+        printf("MODIF: %s\n", f1);
+
+        int ret = lockFile(f1,2);
+        if(ret != 0) perror("??");
+
+        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+        printf("##############################\n");
+    }
+    for(j = 10; j<20; j++){
+        printf("##############################\n");
+        sprintf(f1, "File%lu", j);
+        printf("MODIF: %s\n", f1);
+
+        int ret = unlockFile(f1,3);
+        if(ret != 0) perror("??");
+
+        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+        printf("##############################\n");
+    }
+    for(j = 25; j>=11; j--){
+        printf("##############################\n");
+        sprintf(f1, "File%lu", j);
+        printf("MODIF: %s\n", f1);
+
+        int ret = removeFile(f1,(j%5) + 1);
+        if(ret != 0) perror("??");
+       
+
+        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+        printPQ(priorityQ);
+        printHashTable(storage);
+        printf("##############################\n");
+    }
+
+
+    freeHashTable(storage);
+    freeFifo(priorityQ);
+    
+    printf("##############FINE!################\n");
+
+    storage = createHash(4);
+    priorityQ = createPriorityList();
+    
+    maxNFile = 1000;
+    maxStorageSize = 90000;
+    currentStorageSize = 0;
+    for(j = 1; j<40; j++){
+        sprintf(f1, "File%lu", j);
+        openFile(f1, (3) , (j%5) + 1);
+    }
+    for(j = 1; j<32; j++){
+        sprintf(f1, "File%lu", j);
+
+        fileList* elim = writeFile(f1,t1,(j%5) + 1);
+        if(elim == NULL) perror("??");
+        else {
+            printFileList(elim);
+            freeFileList(elim);
+        }
+    }
+    for(j =1; j<32; j++){
+        printf("##############################\n");
+        sprintf(f1, "File%lu", j);
+        printf("MODIF: %s\n", f1);
+		
+		char* str;
+		size_t* size = malloc(sizeof(size_t));
+		
+        int ret = readFile(f1 , &str, size, (j%5) + 1);
+        if(ret != 0) perror("??");
+		else{
+			printf("%lu--LET:\n%s", *size, str);
+			free(str);
+		}
+		free(size);
+		
+	
+        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+        printPQ(priorityQ);
+        printHashTable(storage);
+        printf("##############################\n");
+    }
+
+    freeHashTable(storage);
+    freeFifo(priorityQ);
+
+    storage = createHash(4);
+    priorityQ = createPriorityList();
+
+    maxNFile = 1000;
+    maxStorageSize = 90000;
+    currentStorageSize = 0;
+    for(j = 1; j<10000; j++){
+        sprintf(f1, "File%lu", j);
+        openFile(f1, j % 4 , (j%5) + 1);
+    }
+    for(j = 7; j<9999; j+=100){
+        printf("##############################\n");
+        sprintf(f1, "File%lu", j);
+        printf("MODIF: %s\n", f1);
+
+        fileList* elim = writeFile(f1,t1,(j%15) + 1);
+        if(elim == NULL) perror("??");
+        else {
+            printFileList(elim);
+            freeFileList(elim);
+        }
+
+        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+        printPQ(priorityQ);
+        printHashTable(storage);
+        printf("##############################\n");
+    }
+
+    freeHashTable(storage);
+    freeFifo(priorityQ);
     return 0;
 }*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
