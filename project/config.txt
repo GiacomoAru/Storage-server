@@ -1,0 +1,4 @@
+nThread=5
+maxNFile=100
+maxStorageSize=2000
+socketName=./ssocket.sk

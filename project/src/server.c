@@ -9,18 +9,20 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <assert.h>
+#include <limits.h>
 
-#define MAXFILENAMELENGHT 108 //lunghezza massima dei path dei file
-#define STANDARDMSGSIZE 1024   // dimensione messaggio standard tra api e server
-#define SMALLMSGSIZE 128 // dimensione messaggio small tra api e server
-#define MAXTEXTLENGHT 1048576 // grandezza massima del contenuto di un file: 1 MB
-#define SOCKET_NAME "./ssocket.sk"  // nome di default per il socket
-
-//gestione errore semplificata e non solo
+//gestione errore semplificata
 #define GESTERRP(a, b) if((a) == NULL){b}
 #define GESTERRI(a, b) if((a)){b}
 #define AGGMAX(a, b) if((a) > (b)) (b) = (a);
 #define POLITIC(a) if(politic == 1) pListLRU((a)); else if(politic == 2) ;
+
+#define MAXFILENAMELENGHT 108 //lunghezza massima dei path dei file
+#define STANDARDMSGSIZE 1024   // dimensione messaggio standard tra api e server
+#define SMALLMSGSIZE 128 // dimensione messaggio small tra api e server
+#define MAXTEXTLENGHT (maxStorageSize - 1) // grandezza massima del contenuto di un file
+#define SOCKET "./ssocket.sk"  // nome di default per il socket
+#define LOGNAME "./log.txt"    // nome di default per il file di log
 
 //typedef funzione hash
 typedef  unsigned long  int  ub4;   /* unsigned 4-byte quantities */
@@ -49,7 +51,7 @@ static long long hashFun(char* s, size_t N){
 }
 //struct per lista di client
 typedef struct sn {
-    size_t clientId;//descrittore client
+    int clientId;//descrittore client
     struct sn *next;
     struct sn *prec;
 } clientNode;
@@ -74,7 +76,7 @@ typedef struct sfi {
     char *path;//path del file
     char *text;//contenuto testuale del file
     clientList *openerList;//lista di client che lo hanno aperto
-    size_t lockOwner;//client che detiene il file
+    int lockOwner;//client che detiene il file
     struct sfi *next;
     struct sfi *prec;
     fPriorityNode *fPointer;//nodo associato alla lista di priorità per la espulsione
@@ -92,29 +94,41 @@ typedef struct sh {
     size_t size;//dimensione
 } hash;
 
+/* LOG:
+ * open_Connection : [Thrd_id]<1/clientFD>
+ * close_Connection : [Thrd_id]<2/clientFD>
+ * open_File : [ThreadID]<3/ret/errno/O_CREATE/O_LOCK/"filePath">
+ * read_File : [Thrd_id]<4/ret/errno/"filePath"/readSize>
+ * read_NFiles : [Thrd_id]<5/0/fileInviati>
+ * write_File : [Thrd_id]<6/ret/errno/"filePath"/listSize>
+ * append_to_File : [Thrd_id]<7/ret/errno/"filePath"/listSize> //non utilizzata
+ * lock_File : [Thrd_id]<8/ret/errno/"filePath">
+ * unlock_File : [Thrd_id]<9/ret/errno/"filePath">
+ * close_File : [ThreadID]<10/ret/errno/"filePath">
+ * remove_File : [Thrd_id]<11/ret/errno/"filePath">
+ */
+FILE *logF; // puntatore al file di log
+pthread_mutex_t logMutex = PTHREAD_MUTEX_INITIALIZER; // mutex per mutua esclusione sul file di log
+
 //VARIABILI GLOBALI
 /*
  * 0 -> FIFO
  * 1 -> LRU
 */
 static int politic = 0;
-
-FILE *logF; // puntatore al file di log
-pthread_mutex_t logMutex = PTHREAD_MUTEX_INITIALIZER; // mutex per mutua esclusione sul file di log
-
 static size_t maxStorageSize;    // dimensione massima dello storage (solo il contenuto dei file)
 static size_t maxNFile;      // numero massimo di files nello storage
-
+char socketName[MAXFILENAMELENGHT]; // nome socket
 static size_t nThread;    // numero di thread worker del server
 
-static hash *storage = NULL;// tabella hash in cui saranno raccolti i files del server
+static hash *storage = NULL;    // tabella hash in cui saranno raccolti i files del server
 //non necessita di una mutex
 
-static priorityList* priorityQ = NULL;//coda per la gestione della priorità di rimpiazzamento dei file
+static priorityList* priorityQ = NULL;      //coda per la gestione della priorità di rimpiazzamento dei file
 pthread_mutex_t pqMutex = PTHREAD_MUTEX_INITIALIZER; // mutex coda priorityList
 //questa cosa di usa e si locka solo dentro una lock dei file, MAI il contrario
 
-static clientList* coda = NULL;     // struttura dati di tipo coda FIFO per la comunicazione Master/Worker
+static clientList* clientQ = NULL;     // struttura dati di tipo coda FIFO per la comunicazione Master/Worker
 pthread_mutex_t cMutex = PTHREAD_MUTEX_INITIALIZER; // mutex per mutua esclusione sugli accessi alla coda
 pthread_cond_t condCoda = PTHREAD_COND_INITIALIZER;
 
@@ -161,16 +175,7 @@ static void safeUnlock(pthread_mutex_t *mtx) {
 
 
 //FREE DEI NODI DELLE LISTE E DELLE LISTE
-/**
- *   @brief Funzione che librea la memoria occupata nello heap di un fifoNode
- *   @param n puntatore al fifoNode
- */
-static void fifoNodeFree(fPriorityNode *n) {
-    GESTERRP(n, return;)
-    free(n->path);
-    free(n);
-    n = NULL;
-}
+
 /**
  *   @brief Funzione che esegue la free su ogni nodo della lista e sulla lista
  *   @param lst puntatore alla clientList di cui fare la free
@@ -190,6 +195,36 @@ static void freeClientList(clientList *lst) {
     free(lst);
     lst = NULL;
 }
+
+/**
+ *   @brief Funzione che librea la memoria occupata nello heap di un fifoNode
+ *   @param n puntatore al fifoNode
+ */
+static void freePriorityNode(fPriorityNode *n) {
+    GESTERRP(n, return;)
+    free(n->path);
+    free(n);
+    n = NULL;
+}
+/**
+ *   @brief Funzione che esegue la free su ogni nodo della lista e sulla lista
+ *   @param lst puntatore alla coda FIFO
+ */
+static void freePriorityList(priorityList *lst) {
+    GESTERRP(lst, errno = EINVAL; return;)
+
+    fPriorityNode *tmp = lst->head;
+
+    while (tmp != NULL) {
+        lst->head = lst->head->next;
+        freePriorityNode(tmp);
+        tmp = lst->head;
+    }
+
+    lst->tail = NULL;
+    free(lst);
+    lst = NULL;
+}
 /**
  *   @brief Funzione che libera la memoria allocata nello heap da un file
  *   @param f puntatore al file
@@ -201,25 +236,6 @@ static void freeFile(file *f) {
     free(f->text);
     free(f);
     f = NULL;
-}
-/**
- *   @brief Funzione che esegue la free su ogni nodo della lista e sulla lista
- *   @param lst puntatore alla coda FIFO
- */
-static void freeFifo(priorityList *lst) {
-    GESTERRP(lst, errno = EINVAL; return;)
-
-    fPriorityNode *tmp = lst->head;
-
-    while (tmp != NULL) {
-        lst->head = lst->head->next;
-        fifoNodeFree(tmp);
-        tmp = lst->head;
-    }
-
-    lst->tail = NULL;
-    free(lst);
-    lst = NULL;
 }
 /**
  *   @brief Funzione che esegue la free su ogni nodo della lista e sulla lista
@@ -262,7 +278,7 @@ static void freeHashTable(hash *tbl) {
  *   @param clientId descrittore della connessione con un client
  *   @return puntatore al clientNode inizializzato, NULL in caso di fallimento
  */
-static clientNode* createClientNode(size_t clientId) {
+static clientNode* createClientNode(int clientId) {
 
     GESTERRI(clientId == 0, errno = EINVAL; return NULL;)
 
@@ -294,7 +310,7 @@ static clientList* createClientList() {
  *   @param clientId  descrittore della connessione con un client
  *   @return true = 1, 0 = false, -1 se genera errore
  */
-static int clientListContains(clientList *lst, size_t clientId) {
+static int clientListContains(clientList *lst, int clientId) {
     GESTERRP(lst, errno = EINVAL; return -1;)
     GESTERRI(clientId == 0, errno = EINVAL; return -1;)
 
@@ -313,7 +329,7 @@ static int clientListContains(clientList *lst, size_t clientId) {
  *   @param clientId descrittore della connessione con un client
  *   @return 1 se termina correttamente, -1 se fallisce
  */
-static int clientListAddH(clientList *lst, size_t clientId) {
+static int clientListAddH(clientList *lst, int clientId) {
     GESTERRP(lst, errno = EINVAL; return -1;)
     GESTERRI(clientId == 0, errno = EINVAL; return -1;)
 
@@ -343,7 +359,7 @@ static int clientListPop(clientList *lst) {
         pthread_cond_wait(&condCoda, &cMutex); // attesa del segnale inviato dal thread main
     }
 
-    size_t ret = lst->tail->clientId;
+    int ret = lst->tail->clientId;
 
     if (lst->head == lst->tail) {
         free(lst->tail);
@@ -356,7 +372,7 @@ static int clientListPop(clientList *lst) {
     }
 
     safeUnlock(&cMutex);
-    return (int) ret;
+    return ret;
 }
 
 /**
@@ -365,7 +381,7 @@ static int clientListPop(clientList *lst) {
  *   @param clientId  descrittore del client
  *   @return 1 se termina correttamente, 0 se fallisce la rimozione, -1 se genera un errore
  */
-static int clientListRemove(clientList* lst, size_t clientId) {
+static int clientListRemove(clientList* lst, int clientId) {
     GESTERRP(lst, errno = EINVAL; return -1;)
     GESTERRI(clientId == 0, errno = EINVAL; return -1;)
 
@@ -404,7 +420,25 @@ static int clientListRemove(clientList* lst, size_t clientId) {
 
     return 0;
 }
+/*
+static void printClientList (clientList* lst){
 
+    if (lst == NULL){
+        errno = EINVAL;
+        safeUnlock(&pqMutex);
+        return;
+    }
+
+    printf("\nSTART QUEUE \n");
+    clientNode* cursor = lst->head;
+    while (cursor != NULL)
+    {
+        printf("%d||",cursor->clientId);
+        cursor = cursor->next;
+    }
+    printf("\nEND QUEUE \n");
+}
+*/
 //FUNZIONI PER LA GESTIONE DI FILE
 /**
  *   @brief Funzione che inizializza un file
@@ -413,7 +447,7 @@ static int clientListRemove(clientList* lst, size_t clientId) {
  *   @param lockOwner descrittore del lock owner
  *   @return puntatore al file inizializzato, NULL in caso di errore
  */
-static file *createFile(char *path, char *text, size_t lockOwner) {
+static file *createFile(char *path, char *text, int lockOwner) {
     GESTERRP(path, errno = EINVAL; return NULL;)
     GESTERRP(text, errno = EINVAL; return NULL;)
 
@@ -555,7 +589,7 @@ static int pListRemove(priorityList *lst, char *path) {
             lst->tail = NULL;
         }
 
-        fifoNodeFree(curr);
+        freePriorityNode(curr);
         safeUnlock(&pqMutex);
         return 1;
     }
@@ -572,7 +606,7 @@ static int pListRemove(priorityList *lst, char *path) {
                 curr->next->prec = curr->prec;
             }
 
-            fifoNodeFree(curr);
+            freePriorityNode(curr);
             safeUnlock(&pqMutex);
             return 1;
         }
@@ -1001,7 +1035,7 @@ static void unlockAllH(hash *ht){
  *   @return un puntatore a fileList che contiene la lista dei file rimossi per creare spazio, NULL altrimenti
 */
 //controlla solo file aggiunti prima del file che ha generato l'overflow, se non riesce a creare abbatstanza spazio ritorna con EFBIG in errno
-static fileList* hashReplaceF(hash *ht, char *path, size_t clientId) {//ENOMEM e ENOTRECOVERABLE e EFBIG
+static fileList* hashReplaceF(hash *ht, char *path, int clientId) {//ENOMEM e ENOTRECOVERABLE e EFBIG
     GESTERRP(ht, errno = EINVAL; return NULL;)
     GESTERRP(path, errno = EINVAL; return NULL;)
     GESTERRI(clientId == 0, errno = EINVAL; return NULL;)
@@ -1067,7 +1101,7 @@ static fileList* hashReplaceF(hash *ht, char *path, size_t clientId) {//ENOMEM e
  *   @param ht puntatore alla tabella hash
  *   @param clientId descrittore del client
 */
-static void hashResetLock(hash *ht, size_t clientId) {
+static void hashResetLock(hash *ht, int clientId) {
     GESTERRP(ht, errno = EINVAL; return;)
 
     int i;
@@ -1099,7 +1133,7 @@ static int isNumber(const char *numbers, long *n) {
 
     char *e = NULL;
     errno = 0;
-    
+
     long val = strtol(numbers, &e, 10);
     if (errno == ERANGE) return 2;    // overflow
     if (e != NULL && *e == (char) 0) {
@@ -1171,15 +1205,6 @@ int writen(long fd, const void *buf, size_t size) {
     return writen;
 }
 /**
- *   @brief Funzione che gestisce i segnali: SIGINT e SIGQUIT = terminazione veloce; SIGHUP = terminazione soft
- *   @param sign segnale ricevuto
-*/
-static void gestTerminazione(int sign) {
-    if (sign == SIGINT || sign == SIGQUIT) t = 1; //1->termina velocemente, ma sempre correttamene (no mem leak e genera stat)
-    else if (sign == SIGHUP)
-        t = 2; //2->termina lentamente completando tutte le richieste ricevute dai client
-}
-/**
  *   @brief funzione per l'aggiornamento del file descriptor massimo
  *   @param fdmax descrittore massimo attuale
  *   @return file descriptor massimo -> successo, -1 altrimenti
@@ -1206,7 +1231,7 @@ static int max_up(fd_set set, int fdmax) {
  *   @param clientId l'id del client che richiede l'operazione
  *   @return 0 se l'operazione va a buon fine, -1 se fallisce
 */
-static int openFile(char *path, int flags, size_t clientId) {
+static int openFile(char *path, int flags, int clientId) {
     GESTERRP(path, errno = EINVAL; return -1;)
     GESTERRI(flags < 0 || flags > 3, errno = EINVAL; return -1;)
 
@@ -1248,24 +1273,24 @@ static int openFile(char *path, int flags, size_t clientId) {
 
             file *dummyF = hashTableGetFile(storage, path);
             GESTERRP(dummyF, safeUnlock(&(dummyL->mtx));perror("openFile");  return -1;)
-            
+
             safeLock(&sMutex);
             openLockSucc++;
             lockSucc++;
             safeUnlock(&sMutex);
 
             if (dummyF->lockOwner == 0 || dummyF->lockOwner == clientId) {//successo
-                
+
                 if(clientListContains(dummyF->openerList, clientId) == 0)
                     if (clientListAddH(dummyF->openerList, clientId) == -1) {
                         perror("openFile");
                         safeUnlock(&(dummyL->mtx));
                         return -1;
                     }
-                
+
                 dummyF->lockOwner = clientId;
                 safeUnlock(&(dummyL->mtx));
-                
+
                 POLITIC(dummyF->fPointer)
                 return 1;
             }
@@ -1352,7 +1377,7 @@ static int openFile(char *path, int flags, size_t clientId) {
  *   @return 0 se l'operazione va a buon fine, 0 se fallisce
 */
 //il buffer viene inizializzato dentro
-static int readFile(char *path, char **buf, size_t *size, size_t clientId) {
+static int readFile(char *path, char **buf, size_t *size, int clientId) {
 
     GESTERRP(path, errno = EINVAL; return -1;)
 
@@ -1366,14 +1391,15 @@ static int readFile(char *path, char **buf, size_t *size, size_t clientId) {
         file *dummyF = hashTableGetFile(storage, path);
         GESTERRP(dummyF, perror("readFile");safeUnlock(&(dummyL->mtx)); return -1;)//serve?
 
-        if ((dummyF->lockOwner == 0 || dummyF->lockOwner == clientId) && clientListContains(dummyF->openerList, clientId)){
+        if ((dummyF->lockOwner == 0 || dummyF->lockOwner == clientId) &&
+            clientListContains(dummyF->openerList, clientId)) {
             //se il client ha aperto il file e esso non è locked
-            *size = strlen(dummyF->text);
+            *size = strlen(dummyF->text) + 1;
 
-            *buf = malloc( sizeof(char) * ( (*size)+1 )  );
-            strncpy(*buf, dummyF->text, ((*size) + 1));
-            
-            
+            *buf = malloc(sizeof(char) * (*size));
+            printf("TESTO: %s\n", dummyF->text);
+            strncpy(*buf, dummyF->text, (*size));
+
 
             safeLock(&sMutex);
             readSucc++;
@@ -1383,23 +1409,19 @@ static int readFile(char *path, char **buf, size_t *size, size_t clientId) {
             safeUnlock(&dummyL->mtx);
 
             POLITIC(dummyF->fPointer)
-           
 
             return 0;
         } else {
-            errno = EPERM;
             safeUnlock(&(dummyL->mtx));
+            errno = EPERM;
             return -1;
         }
-    }
-    else{
+    } else {
         errno = ENOENT;
         safeUnlock(&(dummyL->mtx));
         return -1;
     }
 }
-}
-
 /**
  *   @brief comportamento conforme alla funzione della api
  *   @param path il path del file in cui scrivere
@@ -1407,7 +1429,7 @@ static int readFile(char *path, char **buf, size_t *size, size_t clientId) {
  *   @param clientId l'id del client che richiede l'operazione
  *   @return il puntatore alla lista dei file espulsi, NULL se fallisce o genera errori
 */
-static fileList *writeFile(char *path, char *text, size_t clientId) {
+static fileList *writeFile(char *path, char *text, int clientId) {
     GESTERRP(path, errno= EINVAL; return NULL;)
     GESTERRP(text, errno = EINVAL; return NULL;)
     fileList *dummyL = hashTableGetFList(storage, path);
@@ -1418,7 +1440,7 @@ static fileList *writeFile(char *path, char *text, size_t clientId) {
     GESTERRP(dummyF, safeUnlock(&(dummyL->mtx)); errno = ENOENT; return NULL;)
 
     if(clientListContains(dummyF->openerList, clientId) == 1){
-        if (dummyF->lockOwner == 0 || dummyF->lockOwner != clientId) {
+        if (dummyF->lockOwner != clientId) {
             errno = EPERM;
             safeUnlock(&(dummyL->mtx));//permesso negato
             return NULL;
@@ -1463,7 +1485,7 @@ static fileList *writeFile(char *path, char *text, size_t clientId) {
  *   @param clientId l'id del client che richiede l'operazione
  *   @return il puntatore alla lista dei file espulsi, NULL se fallisce o genera errori
 */
-static fileList *appendToFile(char *path, char *text, size_t clientId) {
+static fileList *appendToFile(char *path, char *text, int clientId) {
     GESTERRP(path, errno= EINVAL; return NULL;)
     GESTERRP(text, errno = EINVAL; return NULL;)
 
@@ -1520,7 +1542,7 @@ static fileList *appendToFile(char *path, char *text, size_t clientId) {
  *   @param clientId l'id del client che richiede l'operazione
  *   @return 0 se termina correttamente, -1 se fallisce
 */
-static int lockFile(char *path, size_t clientId) {
+static int lockFile(char *path, int clientId) {
     GESTERRP(path, errno = EINVAL; return -1;)
 
     fileList *dummyL = hashTableGetFList(storage, path);
@@ -1559,7 +1581,7 @@ static int lockFile(char *path, size_t clientId) {
  *   @param clientId l'id del client che richiede l'operazione
  *   @return 0 se termina correttamente, -1 se fallisce
 */
-static int unlockFile(char *path, size_t clientId) {
+static int unlockFile(char *path, int clientId) {
     GESTERRP(path, errno = EINVAL; return -1;)
 
     fileList *dummyL = hashTableGetFList(storage, path);
@@ -1601,7 +1623,7 @@ static int unlockFile(char *path, size_t clientId) {
  *   @param clientId l'id del client che richiede l'operazione
  *   @return 0 se termina correttamente, -1 se fallisce
 */
-static int closeFile(char *path, size_t clientId) {
+static int closeFile(char *path, int clientId) {
     GESTERRP(path, errno = EINVAL; return -1;)
 
     fileList *dummyL = hashTableGetFList(storage, path);
@@ -1641,7 +1663,7 @@ static int closeFile(char *path, size_t clientId) {
  *   @param clientId l'id del client che richiede l'operazione
  *   @return 0 se termina correttamente, -1 se fallisce
 */
-static int removeFile(char *path, size_t clientId) {
+static int removeFile(char *path, int clientId) {
     GESTERRP(path, errno = EINVAL; return -1;)
 
     fileList *dummyL = hashTableGetFList(storage, path);
@@ -1672,44 +1694,80 @@ static int removeFile(char *path, size_t clientId) {
         return -1;
     }
 }
-static int sendNFile(fileList *fl, int clientId, int pipePF, int *endFlag){
+/**
+ *   @brief Funzione che invia messaggi al client necessari per la trasmissione di N file
+ *   @param fl lista di file da inviare al client
+ *   @param clientId descrittore del cient
+ *   @param pipeFD descrittore della pipe
+ *   @param endFlag puntatore alla flag indicante l'avvenuta chiusura di una connessione
+ */
+static int sendNFile(fileList *fl, int N,  int clientId, int pipeFD, int *endFlag){
 
     file* curr = fl->head;
     char out[STANDARDMSGSIZE];
     int textLen;
+    int i = 0;
 
-    while(curr != NULL){
+    while(i < N){
+        memset(out, 0, STANDARDMSGSIZE);
+
+        if(curr == NULL){//errore
+            sprintf(out, "END");
+            if (writen(clientId, out, STANDARDMSGSIZE) == -1) {//path + sizeText
+                perror("executeTask:sendNFile");
+                *endFlag = 1;
+
+                //USOPIPE
+                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                         errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
+                GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                         errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
+                return -1;
+            }
+            return i;
+        }
 
         textLen = strlen(curr->text) + 1;
         sprintf(out, "%s;%d;", curr->path, textLen);
+        printf("SENDN: %s\n", out);
 
         if (writen(clientId, out, STANDARDMSGSIZE) == -1) {//path + sizeText
-            perror("executeTask:removeFile");
+            perror("executeTask:sendNFile");
             *endFlag = 1;
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+                     errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
             GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+                     errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
             return -1;
         }
         if (writen(clientId, curr->text, textLen) == -1) {//contenuto file
-            perror("executeTask:removeFile");
+            perror("executeTask:sendNFile");
             *endFlag = 1;
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+                     errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
             GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
+                     errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
             return -1;
         }
 
         curr = curr->next;
+        i++;
     }
-    return 0;
+    return i;
 }
+
+//STRUTTURA DI QUEST: FUN_NAME;ARG1;ARG2;...;
+/**
+ *   @brief Funzione che interpreta ed esegue le operazioni richieste dai client
+ *   @param clientId descrittore del cient
+ *   @param pipeFD descrittore della pipe
+ *   @param task richiesta da interpretare e portare a termine
+ *   @param endFlag puntatore alla flag indicante l'avvenuta chiusura di una connessione
+ */
 static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
     GESTERRP(task, errno = EINVAL; return;)
     GESTERRI(clientId < 1, errno = EINVAL; return;)
@@ -1724,7 +1782,6 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
     int errnoValue;// errno per il log
 
     token = strtok_r(task, ";", &save);//tokenizzazione stringa che contiene la task, primo token = tipo di op
-    //se token == NULL allora la richiesta è di disconnessione
 
     //openfile
     if (strcmp(token, "3") == 0) {
@@ -1746,6 +1803,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         if (writen(clientId, out, SMALLMSGSIZE) == -1) {//comunicazione con il client
             perror("executeTask:openFile");
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
@@ -1790,9 +1848,10 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         if (ret == -1) sprintf(out, "-1;%d;", errno);
         else sprintf(out, "0;");
 
-        if (writen(clientId, out, STANDARDMSGSIZE) == -1) {
+        if(writen(clientId, out, SMALLMSGSIZE) == -1) {
             perror("executeTask:closeFile");
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
@@ -1816,7 +1875,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         ret = -2;
 
         safeLock(&lockFileMutex);
-        ret = lockFile(path, clientId);
+        ret = lockFile(token, clientId);
         errnoValue = errno;
         while (ret == -2){
             //il thread attende un segnale che viene mandato quando un client esegue una unlock su un file, o elimina un file
@@ -1832,6 +1891,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         if (writen(clientId, out, SMALLMSGSIZE) == -1) {
             perror("executeTask:lockFile");
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
@@ -1855,7 +1915,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         token = strtok_r(NULL, ";", &save);
 
         // esecuzione della richiesta
-        ret = unlockFile(path, clientId);
+        ret = unlockFile(token, clientId);
         errnoValue = errno;
 
         if (ret == -1) sprintf(out, "-1;%d;", errno);
@@ -1863,6 +1923,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
 
         if (writen(clientId, out, SMALLMSGSIZE) == -1) {
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
@@ -1875,7 +1936,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         //log
         //[Thrd_id]<9/ret/errno/"filePath">
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<9/%d/%d/%s>\n", pthread_self(), ret, errnoValue, path);
+        fprintf(logF, "[%lu]<9/%d/%d/%s>\n", pthread_self(), ret, errnoValue, token);
         safeUnlock(&logMutex);
     }
     //removeFile
@@ -1885,7 +1946,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         token = strtok_r(NULL, ";", &save);
 
         // esecuzione della richiesta
-        ret = removeFile(path, clientId);
+        ret = removeFile(token, clientId);
         errnoValue = errno;
 
         if (ret == -1) sprintf(out, "-1;%d;", errno);
@@ -1895,6 +1956,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         if (writen(clientId, out, SMALLMSGSIZE) == -1) {
             perror("executeTask:removeFile");
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
@@ -1907,7 +1969,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         //log
         //[Thrd_id]<11/ret/errno/"filePath">
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<11/%d/%d/\"%s\">\n", pthread_self(), ret, errnoValue, path);
+        fprintf(logF, "[%lu]<11/%d/%d/\"%s\">\n", pthread_self(), ret, errnoValue, token);
         safeUnlock(&logMutex);
     }
     //writeFile
@@ -1916,20 +1978,20 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         //prossimo messagio: text;
 
         //pathname
-        char path[MAXFILENAMELENGHT];
+        char *path;
         path = strtok_r(NULL, ";", &save);
 
         //dim testo (con terminatore)
         size_t sizeText;
         token = strtok_r(NULL, ";", &save);
-        sizeText = (size_lu) strtol(token, NULL, 10);
+        sizeText = (size_t) strtol(token, NULL, 10);
 
         char text[sizeText];
 
         if (readn(clientId, text, sizeText) == -1) {
-            errno = EIO;
             perror("executeTask:writeFile");
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
@@ -1957,6 +2019,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         if (writen(clientId, out, SMALLMSGSIZE) == -1) {
             perror("executeTask:writeFile");
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
@@ -1967,37 +2030,203 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         }
 
         if(listSize != 0)
-            GESTERRI(sendNFIle(dummyFileList, clientId, pipeFD, endFlag) == -1, freeFileList(dummyFileList);return;)//errore invio messaggi
+            GESTERRI(sendNFile(dummyFileList, listSize, clientId, pipeFD, endFlag) == -1, freeFileList(dummyFileList);return;)//errore invio messaggi
 
         //log
         //[Thrd_id]<6/ret/errno/"filePath"/listSize>
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<6/%d/%d/\"%s\"/%lu>\n", pthread_self(), ret,errnoValue, path, listSize);
+        fprintf(logF, "[%lu]<6/%d/%d/\"%s\"/%lu>\n", pthread_self(), ret,errnoValue, token, listSize);
         safeUnlock(&logMutex);
         freeFileList(dummyFileList);
     }
-
-    //da far
+    //appendToFile
     else if (strcmp(token, "7") == 0) {
+        //7;pathname;sizeText;
+        //prossimo messagio: text;
+
+        //pathname
+        char *path;
+        path = strtok_r(NULL, ";", &save);
+
+        //dim testo (con terminatore)
+        size_t sizeText;
+        token = strtok_r(NULL, ";", &save);
+        sizeText = (size_t) strtol(token, NULL, 10);
+
+        char text[sizeText];
+
+        if (readn(clientId, text, sizeText) == -1) {
+            perror("executeTask:appendToFile");
+            *endFlag = 1;
+            hashResetLock(storage, clientId);
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:appendToFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:appendToFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+        text[sizeText - 1] = '\0';
+
+        // esecuzione della richiesta
+        fileList *dummyFileList = appendToFile(path, text, clientId);
+        errnoValue = errno;
+        size_t listSize = 0;
+        if(dummyFileList != NULL) listSize = dummyFileList->size;
+        if (errnoValue != 0){
+            ret = -1;
+            sprintf(out, "-1;%d;%lu;", errno, listSize);
+        }
+        else {
+            ret = 0;
+            sprintf(out, "0;%lu;", listSize);
+        }
+
+        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
+            perror("executeTask:appendToFile");
+            *endFlag = 1;
+            hashResetLock(storage, clientId);
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:appendToFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:appendToFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+
+        if(listSize != 0)
+            GESTERRI(sendNFile(dummyFileList, listSize, clientId, pipeFD, endFlag) == -1, freeFileList(dummyFileList);return;)//errore invio messaggi
+
+        //log
+        //[Thrd_id]<7/ret/errno/"filePath"/listSize>
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<7/%d/%d/\"%s\"/%lu>\n", pthread_self(), ret,errnoValue, token, listSize);
+        safeUnlock(&logMutex);
+        freeFileList(dummyFileList);
     }
+    //readFile
     else if (strcmp(token, "4") == 0) {
+        //4;pathname;
+
+        token = strtok_r(NULL, ";", &save);
+
+        char *buffer;
+        size_t size;
+
+        ret = readFile(token, &buffer, &size, clientId);//esecuzione read
+        errnoValue = errno;
+
+        if (ret == -1){
+            sprintf(out, "-1;%d;", errno);
+            buffer = NULL;
+            size = 0;
+        }
+        else sprintf(out, "0;%lu;", size); //comando terminato correttamente, 0;dimensioneRead;
+
+        if (writen(clientId, out, SMALLMSGSIZE) == -1) {//successo o fallimento
+            perror("executeTask:readFile");
+            *endFlag = 1;
+            hashResetLock(storage, clientId);
+
+            //USOPIPE
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                     errno = EPIPE; perror("executeTask:readFile"); exit(EXIT_FAILURE);)
+            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                     errno = EPIPE; perror("executeTask:readeFile"); exit(EXIT_FAILURE);)
+            return;
+        }
+        if(ret != -1)
+            if (writen(clientId, buffer, size) == -1) {//se successo, scriviamo la lettura
+                perror("executeTask:readFile");
+                *endFlag = 1;
+                hashResetLock(storage, clientId);
+
+                //USOPIPE
+                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                         errno = EPIPE; perror("executeTask:readFile"); exit(EXIT_FAILURE);)
+                GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                         errno = EPIPE; perror("executeTask:readFile"); exit(EXIT_FAILURE);)
+                return;
+            }//contenuto file
+
+        //log
+        //[Thrd_id]<4/ret/errno/"filePath"/readSize>
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<4/%d/%d/\"%s\"/%lu>\n", pthread_self(), ret, errnoValue, token, size);
+        safeUnlock(&logMutex);
+
+        free(buffer);
     }
+    //readNFiles
     else if (strcmp(token, "5") == 0) {
+        //5;N;
+
+        token = strtok_r(NULL, ";", &save);
+        int N = (int) strtol(token, NULL, 10);
+        int fileInviati = 0;
+        int storageFinito = 0;
+        int lista = 0;
+
+        int dummy;
+        if(N == 0 || N > currentNFile) N = INT_MAX; //valore massimo
+
+        while(fileInviati < N && !storageFinito){
+            //invio file nella pista lista dello storage
+            safeLock(&(storage->lists[lista]->mtx));
+
+            dummy = N - fileInviati;//numero di file giusti
+            if(dummy > (int) storage->lists[lista]->size) dummy = (int) storage->lists[lista]->size;
+
+            GESTERRI(sendNFile(storage->lists[lista],dummy , clientId, pipeFD, endFlag) == -1, return;)
+
+            fileInviati += dummy;
+            safeUnlock(&(storage->lists[lista]->mtx));
+
+            lista++;
+            if(lista >= storage->size) storageFinito = 1;
+        }
+        if(storageFinito && fileInviati<N){//se N era 0 o troppo grande avvisiamo che non abbiamo altro da inviare
+            char out2[STANDARDMSGSIZE] = "END";
+            if (writen(clientId, out2, STANDARDMSGSIZE) == -1) {//path + sizeText
+                perror("executeTask:readNFiles");
+                *endFlag = 1;
+
+                //USOPIPE
+                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                         errno = EPIPE; perror("executeTask:readNFiles"); exit(EXIT_FAILURE);)
+                GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                         errno = EPIPE; perror("executeTask:readNFiles"); exit(EXIT_FAILURE);)
+                return;
+            }
+        }
+
+
+        //log
+        //[Thrd_id]<5/0/fileInviati>
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<5/0/%d>", pthread_self(), fileInviati);
+        safeUnlock(&logMutex);
     }
-
-
+    //closeConnection
     else if (strcmp(token, "2") == 0) {//disconnect
         hashResetLock(storage, clientId);
-
-        pthread_cond_broadcast(&lockFileCondizione);//consizione per ritentare la lockFile
 
         *endFlag = 1;//disconnesso, cambiare client
 
         GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                 errno = EPIPE; perror("executeTask"); exit(EXIT_FAILURE);)
+                 errno = EPIPE; perror("executeTask:closeConnection"); exit(EXIT_FAILURE);)
         GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                 errno = EPIPE; perror("executeTask"); exit(EXIT_FAILURE);)
+                 errno = EPIPE; perror("executeTask:closeConnection"); exit(EXIT_FAILURE);)
+
+        //log
+        //[Thrd_id]<2/clientId>
+        safeLock(&logMutex);
+        fprintf(logF, "[%lu]<2/clientId>", pthread_self());
+        safeUnlock(&logMutex);
     }
+    //default
     else {
         //funzione non implementata
         sprintf(out, "-1;%d", ENOSYS);
@@ -2005,7 +2234,7 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         if (writen(clientId, out, SMALLMSGSIZE) == -1) {
             perror("executeTask:writeFile");
             *endFlag = 1;
-
+            hashResetLock(storage, clientId);
             //USOPIPE
             GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
                      errno = EPIPE; perror("executeTask:default"); exit(EXIT_FAILURE);)
@@ -2016,374 +2245,425 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
     }
 }
 
-static void *w_routine(void *arg) {
-    int fd_pipe = *((int *) arg);
-    int fd_c;
+static void *workerRoutine(void *arg) {
+    //indirizzo pipe passato
+    int pipeFD = *((int *) arg);
+    int clientId;
 
     while (1) {
         int end = 0; //valore indicante la terminazione del client
+        int ret;
 
         //un client viene espulso dalla coda secondo la politica priorityList
-        fd_c = clientListPop(coda);
+        clientId = clientListPop(clientQ);
+        printf("CLIENTID: %d\n", clientId);
 
-        if (fd_c == -2) return (void *) -1;
-        if (fd_c == -1) return (void *) 0;
+        //interruzione
+        if (clientId == -2) return (void *) -1;
+        if (clientId == -1) return (void *) 0;
 
         while (end != 1) {
-            char quest[STANDARDMSGSIZE];
-            memset(quest, 0, STANDARDMSGSIZE);
+            char task[STANDARDMSGSIZE];
+            memset(task, 0, STANDARDMSGSIZE);
 
-            //il client viene servito dal worker in ogni sua richiesta sino alla disconnessione
-            int len = readn(fd_c, quest, STANDARDMSGSIZE);
-            quest[STANDARDMSGSIZE - 1] = '\0';//legale??
+            ret = readn(clientId, task, STANDARDMSGSIZE);
+            //quest[STANDARDMSGSIZE - 1] = '\0';//legale??
 
-            //printf("\n il comando letto è : %s",quest);
-            if (len == -1) {// il client è disconnesso, il worker attenderà il prossimo
+            if (ret == -1) {//client disconnesso, return thread si libera
                 end = 1;//disconnesso, cambiare client
+                hashResetLock(storage, clientId);
 
                 //USOPIPE
-                GESTERRI(write(fd_pipe, &fd_c, sizeof(fd_c)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
                          errno = EPIPE; perror("routine"); exit(EXIT_FAILURE);)
-                GESTERRI(write(fd_pipe, &end, sizeof(end)) == -1,
+                GESTERRI(write(pipeFD, &end, sizeof(end)) == -1,
                          errno = EPIPE; perror("routine"); exit(EXIT_FAILURE);)
-            } else {// richiesta del client ricevuta correttamente
-                if (len != 0) executeTask(quest, fd_c, fd_pipe, &end);
+            }
+            else {//eseguiamo il primo comando del client
+                printf("RICHIESTA: %s\n", task);
+                executeTask(task, clientId, pipeFD, &end);
             }
         }
     }
-    return (void *) 0;
 }
 
-/*
-int main(){
+//main e funzioni che rappresentano la logica del server
+/**
+ *   @brief Funzione che gestisce i segnali: SIGINT e SIGQUIT = terminazione veloce; SIGHUP = terminazione soft
+ *   @param sign segnale ricevuto
+*/
+static void gestTerminazione(int sign) {
+    if (sign == SIGINT || sign == SIGQUIT) t = 1; //terminazione veloce, aspeta solo i thread a lavoro e chiude il server
+    else if (sign == SIGHUP)
+        t = 2; //terminazione soft, esaudisce tutte le operazioni dei clienti in coda
+}
+/**
+ *   @brief Funzione che gestisce la recezione e la gestione dei segnali ricevuti, esempio l'interruzion
+*/
+static void gestSig(){
 
-    storage = createHash(5);
-    priorityQ = createPriorityList();
+    int dummyRet;
+    sigset_t set;
+    struct sigaction s;
+    memset(&s, 0, sizeof(s)); // setta tutta la struct a 0
+    s.sa_handler = gestTerminazione;
 
-    int i;
-    char f1[80];
-    char* t1 = "file_bello_bello\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n";
+    dummyRet = sigfillset(&set);
+    GESTERRI(dummyRet == -1, perror("getSig:sigfillset"); exit(EXIT_FAILURE); )
 
-    char* t2 = "file_bello_bello\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n"
-               "scritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\nscritte-scritte-scritte-scritte-scritte-scritte\n";
+    dummyRet = pthread_sigmask(SIG_SETMASK, &set, NULL);
+    GESTERRI(dummyRet == -1, perror("getSig:pthread_sigmask"); exit(EXIT_FAILURE); )
 
-    for(i = 0; i<30; i++){
-        sprintf(f1, "File%d", i);
-        file* f = createFile(f1, t1, 11);
-        hashTableAdd(storage, f);
-    }
-    for(i = 88; i<100; i++){
-        sprintf(f1, "File%d", i);
-        file* f = createFile(f1, t1, 23);
-        hashTableAdd(storage, f);
-    }
-    for(i = 12; i<19; i++){
-        sprintf(f1, "File%d", i);
-        freeFile(hashTableRemovePath(storage, f1));
-    }
-    sprintf(f1, "File%d", 4);
-    maxStorageSize = 150000;
-    file*f = createFile(f1, t1, 11);
+    dummyRet = sigaction(SIGINT, &s, NULL);  //interruzione da tastiera ctrl+c
+    GESTERRI(dummyRet == -1, perror("getSig:SIGINT"); exit(EXIT_FAILURE); )
 
-    printHashTable(storage);
+    dummyRet = sigaction(SIGQUIT, &s, NULL);  //interruzione da tastiera ctrl+\ ??
+    GESTERRI(dummyRet == -1, perror("getSig:SIGQUIT"); exit(EXIT_FAILURE); )
 
-    printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-    fileList* c = hashReplaceF(storage, f1, (size_t) 11);
-    freeFile(f);
+    dummyRet = sigaction(SIGHUP, &s, NULL);  //interruzione non tastiera
+    GESTERRI(dummyRet == -1, perror("getSig:SIGHUP"); exit(EXIT_FAILURE); )
 
-    printFileList(c);
-    printHashTable(storage);
+    s.sa_handler = SIG_IGN;
+    dummyRet = sigaction(SIGPIPE, &s, NULL);//scrittura su un socket chiuso, ignoro
+    GESTERRI(dummyRet == -1, perror("getSig:SIGPIPE"); exit(EXIT_FAILURE); )
 
-    freeHashTable(storage);
-    freeFileList(c);
-    freeFifo(priorityQ);
+    dummyRet = sigemptyset(&set);//setto la maschera del thread a 00
+    GESTERRI(dummyRet == -1, perror("getSig:sigemptyset"); exit(EXIT_FAILURE); )
 
-    printf("##############FINE!################\n");
+    dummyRet = pthread_sigmask(SIG_SETMASK, &set, NULL);
+    GESTERRI(dummyRet == -1, perror("getSig:pthread_sigmask"); exit(EXIT_FAILURE); )
+}
+/**
+ *   @brief Funzione che esegue il parsing del file di config e setta i parametri del server
+*/
+void parseConfig(char* pathConfig){
+    //int defConfig = 0;
 
-    size_t j;
-    storage = createHash(7);
-    priorityQ = createPriorityList();
+    //valori server standard
+    maxNFile = 100;
+    maxStorageSize = 1048576;
+    nThread = 5;
+    strcpy(socketName, SOCKET);
 
-    maxNFile = 1000;
-    maxStorageSize = 200000;
-    currentStorageSize = 0;
-    for(j = 1; j<40; j++){
-        sprintf(f1, "File%lu", j);
-        openFile(f1, (3) , (j%5) + 1);
-    }
-    for(j = 1; j<32; j++){
-        printf("##############################\n");
-        sprintf(f1, "File%lu", j);
-        printf("MODIF: %s\n", f1);
+    if(pathConfig != NULL) {
 
-        fileList* elim = writeFile(f1,t1,(j%5) + 1);
-        if(elim == NULL) perror("??");
-        else {
-            printFileList(elim);
-            freeFileList(elim);
+        char confLine[100];
+        FILE *conf;
+        conf = fopen(pathConfig, "r"); // apertura del file di config
+        int linea = 1;
+
+        if (conf == NULL) {
+            perror("Errore apertura config");
         }
-
-        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-        printPQ(priorityQ);
-        printHashTable(storage);
-        printf("##############################\n");
-    }
-    for(j = 25; j>=11; j--){
-        printf("##############################\n");
-        sprintf(f1, "File%lu", j);
-        printf("MODIF: %s\n", f1);
-
-        fileList* elim = appendToFile(f1,t1,(j%5) + 1);
-        if(elim == NULL) perror("??");
         else {
-            printFileList(elim);
-            freeFileList(elim);
+
+            char parametro[75];
+            char valore[75];
+            long n;//valore numerale
+
+            while (fgets(confLine, 100, conf) != NULL) {
+                if (confLine[0] != '\n') {
+
+                    //scansione parametro da modificare e valore dello stesso
+                    int err;
+                    err = sscanf(confLine, "%[^=]=%s", parametro, valore);
+
+                    if (err != 2) printf("Formato linea %d non corretto\n", linea);
+                    else {
+                        if (strcmp(parametro, "nThread") == 0) {//numero dei thread
+
+                            int val = isNumber(valore, &n);
+
+                            if (val == 2 || val == 0 || n <= 0) printf("Formato linea %d non corretto\n", linea);
+                            else nThread = (size_t) n;
+                        }
+                        else if (strcmp(parametro, "socketName") == 0) {//nome del socket
+                            strcpy(socketName, valore);
+                        }
+                        else if (strcmp(parametro, "maxNFile") == 0) {//numero massimo di file
+
+                            int out = isNumber(valore, &n);
+
+                            if (out == 2 || out == 0 || n <= 0) printf("Formato linea %d non corretto\n", linea);
+                            else maxNFile = (size_t) n;
+                        }
+                        else if (strcmp(parametro, "maxStorageSize") == 0) {//dimensione massima storage
+
+                            int out = isNumber(valore, &n);
+
+                            if (out == 2 || out == 0 || n <= 0) printf("Formato linea %d non corretto\n", linea);
+                            else maxStorageSize = (size_t) n;
+                        }
+                        else if (strcmp(parametro, "politic") == 0) {//politica dello storage
+
+                            if (strcmp(valore, "FIFO") == 0) politic = 0;
+                            else if (strcmp(valore, "LRU") == 0) politic = 1;
+                                else printf("Formato linea %d non corretto\n", linea);
+                        }
+                        else printf("Formato linea %d non corretto\n", linea);
+                    }
+                }
+                linea++;
+            }
+            fclose(conf);
         }
-
-        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-        printPQ(priorityQ);
-        printHashTable(storage);
-        printf("##############################\n");
     }
 
-    printf("##############################\n");
-    sprintf(f1, "File%lu", 6);
-    printf("MODIF: %s\n", f1);
+    printf("PARAMETRI DEL SERVER\n");
+    printf("  Nome socket: \"%s\"\n  Numero thread: %lu\n  Numero max File: %lu\n  Dimensione max server: %lu\n  Dimensione massima file: %lu\n  Politica: %d\n",
+           socketName, nThread, maxNFile, maxStorageSize, MAXTEXTLENGHT,  politic);
+    return;
+}
 
-    fileList* elim = appendToFile(f1,t2,(6%5) + 1);
-    if(elim == NULL) perror("??");
-    else {
-        printFileList(elim);
-        freeFileList(elim);
+int main(int argc, char *argv[]) {
+
+    // argv[0] server.c | argv[1] config.txt_path | ... | argv[argc] NULL
+    printf("Inizio avvio server\n");
+    int dummyRet;
+    int i; //utile per i cicli for
+    int t_soft = 0;
+
+    char *pathConfig = NULL;
+    if (argc == 3) {
+        if (strcmp(argv[1], "-cnfg") == 0) {
+            pathConfig = argv[2];
+        }
     }
-    printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
+
+    parseConfig(pathConfig);//configurazione valori server
+    gestSig();//gestione segnali e handler, segnali memorizzati nella variabile t
+
+    //strutture dati
+    clientQ = createClientList();//coda richieste clienti
+    GESTERRP(clientQ, perror("creazione coda client"); exit(EXIT_FAILURE);)
+
+    storage = createHash(maxNFile/5);//hash table
+    GESTERRP(storage, perror("creazione hashTable"); exit(EXIT_FAILURE);)
+
+    priorityQ = createPriorityList();//lista priorità di rimpiazzamento
+    GESTERRP(priorityQ, perror("creazione priorityQ"); exit(EXIT_FAILURE);)
+
+    //creazione pipe per comunicazione con i thread
+    int pip[2];
+    dummyRet = pipe(pip);
+    GESTERRI(dummyRet == -1, perror("creazione pipe"); exit(EXIT_FAILURE);)
+
+    //thread pool
+    pthread_t *tPool = malloc(sizeof(pthread_t) * nThread);
+    GESTERRP(tPool, perror("malloc failed"); exit(EXIT_FAILURE);)
+
+    for (i = 0; i < nThread; i++) {
+
+        //creazione dei thread che ricevono l'indirizzo di scrittura della pipe
+        dummyRet = pthread_create(&tPool[i], NULL, workerRoutine, (void *) (&pip[1]));
+        GESTERRI(dummyRet == -1, perror("creazione thread"); exit(EXIT_FAILURE);)
+    }
+
+    ////////////////////////////////////FAREEEEE
+    //SOCKET
+    int socketFD;
+    int clientFD;
+    int fd_num = 0;
+    int dummyFD;
+    fd_set set;
+    fd_set rd_set;
+
+    struct sockaddr_un sa;
+    strncpy(sa.sun_path, socketName, MAXFILENAMELENGHT);
+    sa.sun_family = AF_UNIX;
+
+
+    if ((socketFD = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+        perror("creazione del socket");
+        exit(EXIT_FAILURE);
+    }
+
+    dummyRet = bind(socketFD, (struct sockaddr *) &sa, sizeof(sa));
+    if (dummyRet == -1) {
+        perror("bind del socket");
+        exit(EXIT_FAILURE);
+    }
+
+    listen(socketFD, SOMAXCONN);
+    if (dummyRet == -1) {
+        perror("listen del socket");
+        exit(EXIT_FAILURE);
+    }
+    //fd_num ha il valore del massimo descrittore attivo -> utile per la select
+    if (socketFD > fd_num) fd_num = socketFD;
+    //registrazione del socket
+    FD_ZERO(&set);
+    FD_SET(socketFD, &set);
+    //registrazione della pipe
+    if (pip[0] > fd_num) fd_num = pip[0];
+    FD_SET(pip[0], &set);
+
+    //log
+    logF = fopen(LOGNAME, "w"); //il file di log sempre aperto
+    fflush(logF);   //ripulisco il file
+
+    //inizio ricezione richieste dei client
+    printf("Server avviato, attesa richieste...\n");
+    while (1) {
+
+        rd_set = set;//ripristino il set di partenza
+        if (select(fd_num + 1, &rd_set, NULL, NULL, NULL) == -1) {//gestione errore
+            if (t == 1) break;//chiusura violenta
+            else if (t == 2) { //chiusura soft
+                if (currentConn == 0) break;
+                else {
+                    printf("Chiusura Soft\n");
+                    FD_CLR(socketFD, &set);//rimozione del fd del socket dal set, non accetteremo altre connessioni
+                    if (socketFD == fd_num) fd_num = max_up(set, fd_num);//aggiorno l'indice massimo
+                    close(socketFD);//chiusura del socket
+                    rd_set = set;
+                    dummyRet = select(fd_num + 1, &rd_set, NULL, NULL, NULL);
+                    if (dummyRet == -1) {
+                        perror("select");
+                        break;
+                    }
+                }
+            }
+            else {//fallimento select
+                perror("select");
+                break;
+            }
+        }
+        //controlliamo tutti i file descriptors
+        for (dummyFD = 0; dummyFD <= fd_num; dummyFD++) {
+            if (FD_ISSET(dummyFD, &rd_set)) {
+                if (dummyFD == socketFD) //il socket è pronto per accettare una nuova richiesta di connessine
+                {
+                    if ((clientFD = accept(socketFD, NULL, 0)) == -1) {
+                        if (t == 1) break;//terminazione violenta
+                        else if (t == 2) {//terminazione soft
+                            if (currentConn == 0) break;
+                        } else {
+                            perror("Errore dell' accept");
+                        }
+                    }
+                    printf("accettata connessione\n");
+                    FD_SET(clientFD, &set);//il file del client è pronto in lettura
+
+                    //tengo aggiornato l'indice massimo
+                    AGGMAX(clientFD, fd_num)
+
+                    safeLock(&sMutex);
+                    currentConn++;//aggiornamento variabili per le statistiche
+                    AGGMAX(currentConn, maxConnReach)
+                    safeUnlock(&sMutex);
+                    //printf ("SERVER : Connessione con il Client completata\n");
+                }
+                else if (dummyFD == pip[0]) {// il client è pronto in lettura
+                    int fd_c1;
+                    int l;
+                    int flag;
+                    if ((l = (int) read(pip[0], &fd_c1, sizeof(fd_c1))) > 0) { //lettura del fd di un client
+                        dummyRet = (int) read(pip[0], &flag, sizeof(flag));
+                        if (dummyRet == -1) {
+                            perror("errore nel dialogo Master/Worker");
+                            exit(EXIT_FAILURE);
+                        }
+                        if (flag == 1) {//il client è terminato, il suo fd deve essere rimosso dal set
+                            //printf("Chiusura della connessione\n");
+                            FD_CLR(fd_c1, &set);//rimozione del fd del client termianto dal set
+                            if (fd_c1 == fd_num) fd_num = max_up(set, fd_num);//aggiorno l'indice massimo
+                            close(fd_c1);//chiusura del client
+                            currentConn--;//aggiornamento delle variabili per le statistiche
+                            if (t == 2 && currentConn == 0) {
+                                printf("Terminazione Soft\n");
+                                t_soft = 1;
+                                break;
+                            }
+                        } else {//la richiesta di c1 è stata soddisfatta, aggiorno lo stato del client come pronto
+                            FD_SET(fd_c1, &set);
+                            if (fd_c1 > fd_num) fd_num = fd_c1;//mi assicuro che fd_num contenga l'indice massimo
+                        }
+                    } else if (l == -1) {
+                        perror("errore nel dialogo Master/Worker");
+                        exit(EXIT_FAILURE);
+                    }
+                } else {
+                    //il fd individuato è quello del canale di comunicazione client/server
+                    //il client è pronto in lettura
+                    safeLock(&cMutex);
+                    clientListAddH(clientQ, dummyFD);
+                    pthread_cond_signal(&condCoda);
+                    safeUnlock(&cMutex);
+
+                    //log
+                    //[Thrd_id]<1/clientFD>
+                    safeLock(&logMutex);
+                    fprintf(logF, "[%lu]<1/%d>", pthread_self(), dummyFD);
+                    safeUnlock(&logMutex);
+
+                    FD_CLR(dummyFD, &set);
+                }
+            }
+        }
+        if (t_soft == 1) break;
+    }
+
+
+    //////////////////////////////////// FINE FARE
+
+
+    printf("\nChiusura del Server...\n");
+
+    safeLock(&cMutex);
+    for (i = 0; i < nThread; i++) {
+        clientListAddH(clientQ, -1);
+        pthread_cond_signal(&condCoda);
+    }
+    safeUnlock(&cMutex);
+
+    for (i = 0; i < nThread; i++) {
+        if (pthread_join(tPool[i], NULL) != 0) {
+            perror("Errore in thread join");
+            exit(EXIT_FAILURE);
+        }
+    }
+    free(tPool);
+    remove(socketName);
+
+    //operazioni per stat di read e write
+    size_t mediaReadSize = 0;
+    size_t mediaWriteSize = 0;
+
+    if(readSucc != 0) mediaReadSize = totalReadSize/readSucc;
+    if(writeSucc != 0) mediaWriteSize = totalWriteSize / writeSucc;
+
+    //chiusura file di log
+    fprintf(logF, "END\n");
+    fprintf(logF, "SUNTO DELLE STATISTICHE:\n");
+    fprintf(logF, "Numero di write: %lu;\nSize media delle scritture: %lu;\nNumero di read: %lu;\nSize media delle letture: %lu;\n"
+                  "Numero di openlock: %lu;\nNumero di lock: %lu;\nNumero di unlock: %lu;\nNumero di close: %lu;\n"
+                  "Dimensione massima dello storage: %lu;\nnumero di file massimo: %lu;\nNumero di replace: %lu;\n"
+                  "Massimo numero di connessioni contemporanee: %lu;\n",
+             writeSucc, mediaWriteSize, readSucc, mediaReadSize, openLockSucc, lockSucc, unlockSucc, closeSucc,
+            maxStorageSizeReach, maxNFileReach, replaceSucc, maxConnReach);
+
+    //print andamento del server
+    printf("SERVER INFO:\n");
+    printf("Numero Massimo di files : %lu\n", maxNFileReach);
+    printf("Dimensione Massima raggiunta (MB): %lu\n", maxStorageSizeReach/(1024*1024));
+    printf("Dimensione media delle read: %lu\n", mediaReadSize);
+    printf("Dimensione media delle write: %lu\n", mediaWriteSize);
+    printf("Attivazioni algoritmo di replace: %lu\n", replaceAtt);
+    printf("Numero di files rimossi per rimpiazzamento: %lu\n\n", replaceSucc);
+    printf("HASH TABLE:\n");
+    printHashTable(storage);
+    printf("PRIORITA' RIMPIAZZAMENTO:\n");
     printPQ(priorityQ);
-    printHashTable(storage);
-    printf("##############################\n");
 
-    for(j = 16; j<32; j++){
-        printf("##############################\n");
-        sprintf(f1, "File%lu", j);
-        printf("MODIF: %s\n", f1);
-
-        int ret = unlockFile(f1,(j%5) + 1);
-        if(ret != 0) perror("??");
-
-        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-        printf("##############################\n");
-    }
-    for(j = 10; j<20; j++){
-        printf("##############################\n");
-        sprintf(f1, "File%lu", j);
-        printf("MODIF: %s\n", f1);
-
-        int ret = lockFile(f1,2);
-        if(ret != 0) perror("??");
-
-        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-        printf("##############################\n");
-    }
-    for(j = 10; j<20; j++){
-        printf("##############################\n");
-        sprintf(f1, "File%lu", j);
-        printf("MODIF: %s\n", f1);
-
-        int ret = unlockFile(f1,3);
-        if(ret != 0) perror("??");
-
-        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-        printf("##############################\n");
-    }
-    for(j = 25; j>=11; j--){
-        printf("##############################\n");
-        sprintf(f1, "File%lu", j);
-        printf("MODIF: %s\n", f1);
-
-        int ret = removeFile(f1,(j%5) + 1);
-        if(ret != 0) perror("??");
-       
-
-        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-        printPQ(priorityQ);
-        printHashTable(storage);
-        printf("##############################\n");
-    }
-
-
+    //free finali
     freeHashTable(storage);
-    freeFifo(priorityQ);
-    
-    printf("##############FINE!################\n");
+    freePriorityList(priorityQ);
+    freeClientList(clientQ);
+    fclose(logF);
 
-    storage = createHash(4);
-    priorityQ = createPriorityList();
-    
-    maxNFile = 1000;
-    maxStorageSize = 90000;
-    currentStorageSize = 0;
-    for(j = 1; j<40; j++){
-        sprintf(f1, "File%lu", j);
-        openFile(f1, (3) , (j%5) + 1);
-    }
-    for(j = 1; j<32; j++){
-        sprintf(f1, "File%lu", j);
-
-        fileList* elim = writeFile(f1,t1,(j%5) + 1);
-        if(elim == NULL) perror("??");
-        else {
-            printFileList(elim);
-            freeFileList(elim);
-        }
-    }
-    for(j =1; j<32; j++){
-        printf("##############################\n");
-        sprintf(f1, "File%lu", j);
-        printf("MODIF: %s\n", f1);
-		
-		char* str;
-		size_t* size = malloc(sizeof(size_t));
-		
-        int ret = readFile(f1 , &str, size, (j%5) + 1);
-        if(ret != 0) perror("??");
-		else{
-			printf("%lu--LET:\n%s", *size, str);
-			free(str);
-		}
-		free(size);
-		
-	
-        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-        printPQ(priorityQ);
-        printHashTable(storage);
-        printf("##############################\n");
-    }
-
-    freeHashTable(storage);
-    freeFifo(priorityQ);
-
-    storage = createHash(4);
-    priorityQ = createPriorityList();
-
-    maxNFile = 1000;
-    maxStorageSize = 90000;
-    currentStorageSize = 0;
-    for(j = 1; j<10000; j++){
-        sprintf(f1, "File%lu", j);
-        openFile(f1, j % 4 , (j%5) + 1);
-    }
-    for(j = 7; j<9999; j+=100){
-        printf("##############################\n");
-        sprintf(f1, "File%lu", j);
-        printf("MODIF: %s\n", f1);
-
-        fileList* elim = writeFile(f1,t1,(j%15) + 1);
-        if(elim == NULL) perror("??");
-        else {
-            printFileList(elim);
-            freeFileList(elim);
-        }
-
-        printf("max dim= %lu     curr dim= %lu\n", maxStorageSize, currentStorageSize);
-        printPQ(priorityQ);
-        printHashTable(storage);
-        printf("##############################\n");
-    }
-
-    freeHashTable(storage);
-    freeFifo(priorityQ);
     return 0;
-}*/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+}
 
 
 
