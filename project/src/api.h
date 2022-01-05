@@ -17,7 +17,8 @@
 
 size_t getLastOpWSize();
 size_t getLastOpRSize();
-int msSleep(long time);
+size_t getTotOp();
+void setSleep(long time);
 
 int openConnection(const char* nome_sock, int msec, const struct timespec abstime);
 int closeConnection(const char* nome_sock);

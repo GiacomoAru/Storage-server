@@ -1,0 +1,81 @@
+[67365760]<1/7>[100771584]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/1MB.txt">
+[100771584]<6/0/0/"1048171"/0>
+[100771584]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/1MB.txt">
+[100771584]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/5MB.txt">
+[100771584]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/50MB.txt">
+[100771584]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/50MB_copia.txt">
+[100771584]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/secondoCoso.txt">
+[100771584]<6/0/0/"8191"/0>
+[100771584]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/secondoCoso.txt">
+[100771584]<2/clientId>
+[67365760]<1/7>[109164288]<8/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/1MB.txt">
+[109164288]<8/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/secondoCoso.txt">
+[109164288]<8/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/50MB_copia.txt">
+[109164288]<8/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/50MB.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/textFile6.txt">
+[109164288]<6/0/0/"306"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/textFile6.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/textFile4.txt">
+[109164288]<6/0/0/"129"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/textFile4.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/textFile5.txt">
+[109164288]<6/0/0/"431"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/textFile5.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/dir7/textFile9.txt">
+[109164288]<6/0/0/"615"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/dir7/textFile9.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/dir7/textFile8.txt">
+[109164288]<6/0/0/"616"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/dir7/textFile8.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/textFile2.txt">
+[109164288]<6/0/0/"203"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/textFile2.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/textFile3.txt">
+[109164288]<6/0/0/"302"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/textFile3.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/riempi_1.0.lua">
+[109164288]<6/0/0/"6694"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/riempi_1.0.lua">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/main.txt">
+[109164288]<6/0/0/"7401"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/main.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/scava_1.2.lua">
+[109164288]<6/0/0/"10694"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/scava_1.2.lua">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/output1.txt">
+[109164288]<6/0/0/"11234"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/output1.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/scava_1.1.lua">
+[109164288]<6/0/0/"10715"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/scava_1.1.lua">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/scava_1.0.lua">
+[109164288]<6/0/0/"10810"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir5/scava_1.0.lua">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/textFile1.txt">
+[109164288]<6/0/0/"184"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/textFile1.txt">
+[109164288]<3/0/0/1|1/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/textFile7.txt">
+[109164288]<6/0/0/"354"/0>
+[109164288]<10/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/textFile7.txt">
+[109164288]<2/clientId>
+[67365760]<1/7>[125949696]<3/0/0/0|0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/textFile5.txt">
+[125949696]<4/0/0/"/home/xubuntu/Scrivania/project 17/test1/dir1/dir3/dir4/textFile5.txt"/431>
+[67365760]<1/7>[117556992]<5/0/5>
+[117556992]<2/clientId>
+[67365760]<1/7>[134342400]<2/clientId>
+[67365760]<1/7>[100771584]<2/clientId>
+
+===================================================================================================================================
+SUNTO DELLE STATISTICHE:
+Numero di write: 17
+Size media delle scritture: 65707
+Numero di read: 1
+Size media delle letture: 431
+Numero di openlock: 0
+Numero di lock: 4
+Numero di unlock: 0
+Numero di close: 17
+Dimensione massima dello storage: 2 (MB)
+Numero di file massimo: 20
+Numero di replace: 0
+Massimo numero di connessioni contemporanee: 1

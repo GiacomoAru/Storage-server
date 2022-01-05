@@ -14,16 +14,19 @@
 
 #define STANDARDMSGSIZE 1024   // dimensione messaggio standard tra api e server
 #define SMALLMSGSIZE 128 // dimensione messaggio small tra api e server
-#define MAXTEXTLENGHT 1048576 // grandezza massima del contenuto di un file : 1MB
+#define BIGMSGSIZE 10240 //dimensione messaggio big tra api e server
+#define MAXTEXTLENGHT maxText // grandezza massima del contenuto di un file : 1MB
 #define MAXFILENAMELENGHT 108 // lunghezza standard unix
 
 //errori
 #define GESTERRP(a, b) if((a) == NULL){b}
 #define GESTERRI(a, b) if((a)){b}
 
+
 static int statoConnessione = 0;//flag indicante lo stato di connessione del client
 static int socketFD; //fd del socket
 static char socketName[MAXFILENAMELENGHT]; //nome del socket
+
 
 //dimensione letture e scritture
 static size_t lastOpWSize = 0;//write sul server
@@ -31,13 +34,25 @@ static size_t lastOpRSize = 0;//read dal server
 size_t getLastOpWSize(){ return lastOpWSize; }
 size_t getLastOpRSize(){ return lastOpRSize; }
 
+//totale operazioni eseguite con il server e lunghezza testo file massima
+static long totOperazioni = 0;
+size_t getTotOp(){ return totOperazioni; }
+static long maxText = 0; //dimensione massima di un file
+static long tSleep = 0;
 
+/**
+ *   @brief funzione che setta il tempo di attesa standard da attendere prima di eseguire una operazione (non open connection)
+ *   @param time tempo di attesa tra 2 operazioni consecutive
+ */
+void setSleep(long time){
+    tSleep = time;
+}
 /**
  *   @brief funzione che ferma l'esecuzione del programma per time millisecondi
  *   @param time tempo di attesa
  *   @return 0 se termina correttamente, -1 altrimenti
  */
-int msSleep(long time){
+static int msSleep(long time){
     if(time < 0){
         errno = EINVAL;
     }
@@ -144,6 +159,8 @@ int writen(long fd, const void *buf, size_t nbyte){
  *   @return 0 se termina correttamente, -1 se genera errore
  */
 int receiveNFile(int n, const char* dir){
+    totOperazioni++;//operazione iniziata
+
     int i = 0;
     int textSize = 0;
     char firstMsg[STANDARDMSGSIZE] = "";
@@ -158,29 +175,39 @@ int receiveNFile(int n, const char* dir){
     while(i<n){
 
         GESTERRI(readn(socketFD, firstMsg, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//lettura path
-        printf("RICEVUTO: %s\n", firstMsg);
 
         GESTERRI(strcmp(firstMsg, "END") == 0, return i;)//se i file finiscono prima del previsto
 
         char *token;
         char *save = NULL;
-        token = strtok_r(firstMsg, ";", &save);//esito richiesta
+        token = strtok_r(firstMsg, "|", &save);//esito richiesta
         basePath = basename(token);
 
-        token = strtok_r(NULL, ";", &save);//ricevuta dimensione del testo
+        token = strtok_r(NULL, "|", &save);//ricevuta dimensione del testo
         textSize = strtol(token , NULL, 10);
 
         text = malloc(sizeof(char) * textSize);
         GESTERRP(text, errno = ENOMEM; perror("receiveNFile"); return -1;)//fallimento malloc
-        GESTERRI(readn(socketFD, text, textSize) == -1, free(text); errno = EREMOTEIO; return -1;)//lettura contenuto di un file
+
+        //lettura classica
+        int pos = 0;
+        while(textSize - pos > BIGMSGSIZE) {
+            GESTERRI(readn(socketFD, text + pos, BIGMSGSIZE) == -1,
+                     free(text); errno = EREMOTEIO; return -1;)//lettura contenuto di un file
+            pos += BIGMSGSIZE;
+        }
+        GESTERRI(readn(socketFD, text + pos, textSize - pos) == -1,
+                 free(text); errno = EREMOTEIO; return -1;)//lettura contenuto di un file
+
         lastOpRSize += textSize;//incremento i byte totali letti
+        if(dir != NULL) {
+            sprintf(finalPath, "%s/%s", dir, basePath);//path del file da creare trovato
+            newFile = fopen(finalPath, "w");//file aperto o creato
+            GESTERRP(newFile, perror("fopen");continue;)
 
-        sprintf(finalPath, "%s/%s", dir, basePath);//path del file da creare trovato
-        newFile = fopen(finalPath, "w");//file aperto o creato
-        GESTERRP(newFile, perror("receiveNFile");)
-
-        fprintf(newFile, "%s", text);
-        fclose(newFile);
+            fprintf(newFile, "%s", text);
+            fclose(newFile);
+        }
 
         free(text);
         i++;
@@ -188,7 +215,11 @@ int receiveNFile(int n, const char* dir){
     return i;
 }
 
+/**
+ *  Di seguito funzioni descritte nel testo del progetto
+ */
 int openConnection(const char* sockname, int msec, const struct timespec abstime) {
+    totOperazioni++;//operazione iniziata
     GESTERRP(sockname, errno = EINVAL; return -1;)//socket name == NULL
 
     struct sockaddr_un sa;
@@ -212,18 +243,25 @@ int openConnection(const char* sockname, int msec, const struct timespec abstime
         return -1;
     }
 
+    //lettura grandezza massima di un testo
+    char message[SMALLMSGSIZE];
+    GESTERRI(readn(socketFD, message, SMALLMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//lettura
+    maxText = strtol(message, NULL, 10);
+
     statoConnessione = 1;//siamo connessi
     strcpy(socketName, sockname);//memorizziamo il nome del socket
     return 0;
 }
 int closeConnection(const char* sockname){
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
 
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//disconnesso
 
     if (strcmp(socketName,sockname) == 0){// socket corretto
         char buffer [STANDARDMSGSIZE];
         memset(buffer,0,STANDARDMSGSIZE);
-        sprintf(buffer,"2;");
+        sprintf(buffer,"2|");
 
         GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//inviamo il messaggio di chiusura
         GESTERRI(close(socketFD) == -1, errno = EREMOTEIO; return -1;)//chiudiamo connessione
@@ -236,12 +274,14 @@ int closeConnection(const char* sockname){
     }
 }
 int openFile(const char* pathname, int flags) {
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
 
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
     char buffer [STANDARDMSGSIZE];
     memset(buffer,0,STANDARDMSGSIZE);
-    snprintf(buffer, STANDARDMSGSIZE,"3;%d;%s;",flags , pathname);// il comando viene scritto sulla stringa buffer
+    snprintf(buffer, STANDARDMSGSIZE,"3|%d|%s|",flags , pathname);// il comando viene scritto sulla stringa buffer
 
     GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura
     char message[SMALLMSGSIZE];
@@ -249,22 +289,24 @@ int openFile(const char* pathname, int flags) {
 
     char* token;
     char* save = NULL;
-    token = strtok_r(message,";", &save);
+    token = strtok_r(message,"|", &save);
 
     if (strcmp(token, "-1") == 0){ //op fallita
-        token = strtok_r(NULL,";", &save);
+        token = strtok_r(NULL,"|", &save);
         errno = (int)strtol(token, NULL, 10);
         return -1;
     }
     else return 0;
 }
 int closeFile(const char* pathname) {
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
 
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
     char buffer[STANDARDMSGSIZE];
     memset(buffer,0,STANDARDMSGSIZE);
-    sprintf(buffer, "10;%s;", pathname);
+    sprintf(buffer, "10|%s|", pathname);
 
     GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura
     char message[SMALLMSGSIZE];
@@ -272,10 +314,10 @@ int closeFile(const char* pathname) {
 
     char* token;
     char* save = NULL;
-    token = strtok_r(message, ";", &save);
+    token = strtok_r(message, "|", &save);
 
     if (strcmp(token, "-1") == 0){
-        token = strtok_r(NULL,";", &save);
+        token = strtok_r(NULL,"|", &save);
         errno = (int)strtol(token, NULL, 10);
         return -1;
     }
@@ -283,12 +325,14 @@ int closeFile(const char* pathname) {
 
 }
 int removeFile(const char* path) {
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
 
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
     char buffer [STANDARDMSGSIZE];
     memset(buffer,0,STANDARDMSGSIZE);
-    sprintf(buffer, "11;%s;", path);
+    sprintf(buffer, "11|%s|", path);
 
     GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura
     char message[SMALLMSGSIZE];
@@ -296,22 +340,24 @@ int removeFile(const char* path) {
 
     char* token;
     char* save = NULL;
-    token = strtok_r(message, ";", &save);
+    token = strtok_r(message, "|", &save);
 
     if (strcmp(token, "-1") == 0){ // operazione fallita
-        token = strtok_r(NULL,";",&save);
+        token = strtok_r(NULL,"|",&save);
         errno = (int)strtol(token, NULL, 10);
         return -1;
     }
     else return 0;
 }
 int lockFile(const char* path) {
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
 
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
     char buffer [STANDARDMSGSIZE];
     memset(buffer,0,STANDARDMSGSIZE);
-    sprintf(buffer, "8;%s;", path);
+    sprintf(buffer, "8|%s|", path);
 
     GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura
     char message[SMALLMSGSIZE];
@@ -319,22 +365,24 @@ int lockFile(const char* path) {
 
     char* token;
     char* save = NULL;
-    token = strtok_r(message, ";", &save);
+    token = strtok_r(message, "|", &save);
 
     if (strcmp(token, "-1") == 0) { //operazione fallita
-        token = strtok_r(NULL,";",&save);
+        token = strtok_r(NULL,"|",&save);
         errno = (int)strtol(token, NULL, 10);
         return -1;
     }
     else return 0;
 }
 int unlockFile(const char* path){
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
 
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
     char buffer [STANDARDMSGSIZE];
     memset(buffer,0,STANDARDMSGSIZE);
-    sprintf(buffer, "9;%s;", path);
+    sprintf(buffer, "9|%s|", path);
 
     GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura
     char message[SMALLMSGSIZE];
@@ -342,16 +390,18 @@ int unlockFile(const char* path){
 
     char* token;
     char* save = NULL;
-    token = strtok_r(message, ";", &save);
+    token = strtok_r(message, "|", &save);
 
     if (strcmp(token, "-1") == 0){ //operazione fallita
-        token = strtok_r(NULL,";", &save);
+        token = strtok_r(NULL,"|", &save);
         errno = (int)strtol(token, NULL, 10);
         return -1;
     }
     else return 0;
 }
 int writeFile(const char* pathname, const char* dir) {
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
 
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
@@ -363,18 +413,20 @@ int writeFile(const char* pathname, const char* dir) {
     FILE *fileP = fopen(pathname, "r");
     GESTERRP(fileP, errno = ENOENT; return -1;)//apriamo il file
 
-    char dummy[MAXTEXTLENGHT] = "\0";
-    char bufferCopia[50];
+    char* dummy = malloc(sizeof(char) * MAXTEXTLENGHT);
+    memset(dummy, 0, MAXTEXTLENGHT);
+
+    char bufferCopia[512];
     int n = 0;
-    int charLetti = fread(bufferCopia, sizeof(char), 50, fileP);
+    int charLetti = fread(bufferCopia, sizeof(char), 512, fileP);
     while(charLetti > 0){
 
-        if(n + charLetti>= MAXTEXTLENGHT){ fclose(fileP); errno = EFBIG; return -1;}//file troppo grande
+        if(n + charLetti>= MAXTEXTLENGHT){ fclose(fileP); free(dummy);  errno = EFBIG; return -1;}//file troppo grande
 
         memcpy(dummy + n, bufferCopia, charLetti);
         n += charLetti;
 
-        if(charLetti == 50) charLetti = fread(bufferCopia, sizeof(char), 50, fileP);
+        if(charLetti == 512) charLetti = fread(bufferCopia, sizeof(char), 512, fileP);
         else charLetti = -1;
     }
     fclose(fileP);//chiudiamo il file
@@ -384,17 +436,25 @@ int writeFile(const char* pathname, const char* dir) {
     // preparaione del comando per il server
     char buffer[STANDARDMSGSIZE];
     memset(buffer, 0, STANDARDMSGSIZE);
-    sprintf(buffer, "6;%s;%d;", pathname, n);//primo messaggio
+    sprintf(buffer, "6|%s|%d|", pathname, n);//primo messaggio
 
-    GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura 1
-    GESTERRI(writen(socketFD, dummy, n) == -1, errno = EREMOTEIO; return -1;)//scrittura 2
+    GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, free(dummy); errno = EREMOTEIO; return -1;)//scrittura 1
+
+    //se il testo è piccolo mandiamo un solo messaggio, se è grande lo spezziamo
+    int pos = 0;
+    while(n - pos > BIGMSGSIZE) {
+        GESTERRI(writen(socketFD, (dummy + pos), BIGMSGSIZE) == -1, free(dummy); errno = EREMOTEIO; return -1;)//scrittura 2.1
+        pos += BIGMSGSIZE;
+    }
+    GESTERRI(writen(socketFD, (dummy + pos), (n - pos)) == -1, free(dummy); errno = EREMOTEIO; return -1;)//scrittura 2.2
     lastOpWSize = n;//imposto la dimensione di scrittura
-
+    
     char message[SMALLMSGSIZE];
-    GESTERRI(readn(socketFD, message, SMALLMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//lettura
+    GESTERRI(readn(socketFD, message, SMALLMSGSIZE) == -1,free(dummy); errno = EREMOTEIO; return -1;)//lettura
+    free(dummy);
 
     char *save = NULL;
-    char *token = strtok_r(message, ";", &save);//esito richiesta
+    char *token = strtok_r(message, "|", &save);//esito richiesta
 
     int errnoVal = 0;
     int retVal;
@@ -402,19 +462,21 @@ int writeFile(const char* pathname, const char* dir) {
     retVal =  strtol(token, NULL, 10);
 
     if (retVal != 0) { //se l'operazione è fallita memorizziamo errno
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
         errnoVal = (int) strtol(token, NULL, 10);
     }
 
-    token = strtok_r(NULL, ";", &save);
+    token = strtok_r(NULL, "|", &save);
     int nFile = strtol(token, NULL, 10);//controlliamo se abbiamo file da memorizzare
 
-    if(nFile != 0 && dir != NULL) GESTERRI(receiveNFile(nFile, dir) == -1, return -1;)//abbiamo file da memorizzare e lo facciamo
+    if(nFile != 0 && dir != NULL) GESTERRI(receiveNFile(nFile, dir) == -1,  return -1;)//abbiamo file da memorizzare e lo facciamo
 
     errno = errnoVal;
     return retVal;//restituiamo l'esito dell'operazione e settiamo errno correttamente
 }
 int appendToFile(const char* pathname, void* buf, size_t size, const char* dir){
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
     if (dir != NULL)// se la directory non esiste viene creata
@@ -425,10 +487,15 @@ int appendToFile(const char* pathname, void* buf, size_t size, const char* dir){
     //preparaione del comando per il server
     char buffer[STANDARDMSGSIZE];
     memset(buffer, 0, STANDARDMSGSIZE);
-    sprintf(buffer, "7;%s;%lu;", pathname, size);//primo messaggio
-
+    sprintf(buffer, "7|%s|%lu|", pathname, size);//primo messaggio
     GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura 1
-    GESTERRI(writen(socketFD, buf, size) == -1, errno = EREMOTEIO; return -1;)//scrittura 2
+
+    int pos = 0;
+    while(size - pos > BIGMSGSIZE) {
+        GESTERRI(writen(socketFD, (buf + pos), BIGMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura 2.1
+        pos += BIGMSGSIZE;
+    }
+    GESTERRI(writen(socketFD, (buf + pos), (size - pos)) == -1,  errno = EREMOTEIO; return -1;)//scrittura 2.2
     lastOpWSize = size;//imposto la dimensione di scrittura
 
     char message[SMALLMSGSIZE];
@@ -436,7 +503,7 @@ int appendToFile(const char* pathname, void* buf, size_t size, const char* dir){
 
     char *token;
     char *save = NULL;
-    token = strtok_r(message, ";", &save);//esito richiesta
+    token = strtok_r(message, "|", &save);//esito richiesta
 
     int errnoVal = 0;
     int retVal;
@@ -444,11 +511,11 @@ int appendToFile(const char* pathname, void* buf, size_t size, const char* dir){
     retVal =  strtol(token, NULL, 10);
 
     if (retVal != 0) { //se l'operazione è fallita memorizziamo errno
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
         errnoVal = (int) strtol(token, NULL, 10);
     }
 
-    token = strtok_r(NULL, ";", &save);
+    token = strtok_r(NULL, "|", &save);
     int nFile = strtol(token, NULL, 10);//controlliamo se abbiamo file da memorizzare
 
     if(nFile != 0 && dir != NULL) GESTERRI(receiveNFile(nFile, dir) == -1, return -1;)//abbiamo file da memorizzare e lo facciamo
@@ -457,44 +524,54 @@ int appendToFile(const char* pathname, void* buf, size_t size, const char* dir){
     return retVal;//restituiamo l'esito dell'operazione e settiamo errno correttamente
 }
 int readFile(const char* pathname, void** buf, size_t* size){
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
     char buffer [STANDARDMSGSIZE];
     memset(buffer,0,STANDARDMSGSIZE);
-    sprintf(buffer, "4;%s;",pathname);
+    sprintf(buffer, "4|%s|",pathname);
 
     GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura
     char message[SMALLMSGSIZE];
     GESTERRI(readn(socketFD, message, SMALLMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//lettura
-    //0;10;
+    //0|10|
     //msg dimensione 10
 
     char* token;
     char* save = NULL;
-    token = strtok_r(message, ";", &save);
+    token = strtok_r(message, "|", &save);
 
     if (strcmp(token, "-1") == 0){
-        token = strtok_r(NULL, ";",&save);
+        token = strtok_r(NULL, "|",&save);
         errno = (int)strtol(token, NULL, 10);
         return -1;
     }
     else{
-        token = strtok_r(NULL, ";",&save);
-
+        token = strtok_r(NULL, "|",&save);
         *size = (unsigned long)strtol(token, NULL, 10);
-        printf("%lu\n", *size);
         *buf = malloc(sizeof(char) * (*size));
         GESTERRP(*buf, perror("malloc failed"); return -1;)
 
         memset(*buf, 0, sizeof(char) * (*size));
 
-        GESTERRI(readn(socketFD, *buf, *size) == -1, errno = EREMOTEIO; return -1;)//lettura
+        int pos = 0;
+        while((*size) - pos > BIGMSGSIZE) {
+            GESTERRI(readn(socketFD, (*buf + pos), BIGMSGSIZE) == -1,
+                     errno = EREMOTEIO; return -1;)//lettura contenuto di un file
+            pos += BIGMSGSIZE;
+        }
+        GESTERRI(readn(socketFD, (*buf + pos), (*size) - pos) == -1,
+                 errno = EREMOTEIO; return -1;)//lettura contenuto di un file
+
         lastOpRSize = *size;
 
         return 0;
     }
 }
 int readNFiles(int N, const char* dir) {
+    msSleep(tSleep);//attesa tra 2 operazioni
+    totOperazioni++;//operazione iniziata
     GESTERRI(statoConnessione == 0, errno = ENOTCONN; return -1;)//client disconnesso
 
     if (dir != NULL)// se la directory non esiste viene creata
@@ -505,7 +582,7 @@ int readNFiles(int N, const char* dir) {
 
     char buffer [STANDARDMSGSIZE];
     memset(buffer,0,STANDARDMSGSIZE);
-    sprintf(buffer, "5;%d;",N);
+    sprintf(buffer, "5|%d|",N);
 
     GESTERRI(writen(socketFD, buffer, STANDARDMSGSIZE) == -1, errno = EREMOTEIO; return -1;)//scrittura
 

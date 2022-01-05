@@ -16,11 +16,26 @@
 #define GESTERRI(a, b) if((a)){b}
 #define AGGMAX(a, b) if((a) > (b)) (b) = (a);
 #define POLITIC(a) if(politic == 1) pListLRU((a)); else if(politic == 2) ;
+#define PRINT(a) if(print > 0){a}
+
+//tutte le scritture e letture nel socket per comunicare con il client portano allo stesso risultato se fallite
+//il trattare il client come disconnesso
+#define GESTERRPIPE(a,b)                                                                                                              \
+    if(a){                                                                                                                          \
+        perror((b));                                                                                                                \
+        *endFlag = 1;                                                                                                               \
+        hashResetLock(storage, clientId);                                                                                           \
+        GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,                                                                  \
+                 errno = EPIPE; perror((b)); exit(EXIT_FAILURE);)                                                                   \
+        GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,                                                                    \
+                 errno = EPIPE; perror((b)); exit(EXIT_FAILURE);)                                                                   \
+        return;}
 
 #define MAXFILENAMELENGHT 108 //lunghezza massima dei path dei file
 #define STANDARDMSGSIZE 1024   // dimensione messaggio standard tra api e server
 #define SMALLMSGSIZE 128 // dimensione messaggio small tra api e server
-#define MAXTEXTLENGHT (maxStorageSize - 1) // grandezza massima del contenuto di un file
+#define BIGMSGSIZE 10240 //dimensione messaggio big tra api e server
+#define MAXTEXTLENGHT maxText // grandezza massima del contenuto di un file
 #define SOCKET "./ssocket.sk"  // nome di default per il socket
 #define LOGNAME "./log.txt"    // nome di default per il file di log
 
@@ -95,17 +110,17 @@ typedef struct sh {
 } hash;
 
 /* LOG:
- * open_Connection : [Thrd_id]<1/clientFD>
- * close_Connection : [Thrd_id]<2/clientFD>
- * open_File : [ThreadID]<3/ret/errno/O_CREATE/O_LOCK/"filePath">
- * read_File : [Thrd_id]<4/ret/errno/"filePath"/readSize>
- * read_NFiles : [Thrd_id]<5/0/fileInviati>
- * write_File : [Thrd_id]<6/ret/errno/"filePath"/listSize>
- * append_to_File : [Thrd_id]<7/ret/errno/"filePath"/listSize> //non utilizzata
- * lock_File : [Thrd_id]<8/ret/errno/"filePath">
- * unlock_File : [Thrd_id]<9/ret/errno/"filePath">
- * close_File : [ThreadID]<10/ret/errno/"filePath">
- * remove_File : [Thrd_id]<11/ret/errno/"filePath">
+ * open_Connection : [Thrd_id]<clientId/1>
+ * close_Connection : [Thrd_id]<clientId/2>
+ * open_File : [ThreadID]<clientId/3/ret/errno/O_CREATE/O_LOCK/"filePath">
+ * read_File : [Thrd_id]<clientId/4/ret/errno/"filePath"/readSize>
+ * read_NFiles : [Thrd_id]<clientId/5/0/fileInviati>
+ * write_File : [Thrd_id]<clientId/6/ret/errno/"filePath"/listSize>
+ * append_to_File : [Thrd_id]<clientId/7/ret/errno/"filePath"/listSize> //non utilizzata
+ * lock_File : [Thrd_id]<clientId/8/ret/errno/"filePath">
+ * unlock_File : [Thrd_id]<clientId/9/ret/errno/"filePath">
+ * close_File : [ThreadID]<clientId/10/ret/errno/"filePath">
+ * remove_File : [Thrd_id]<clientId/11/ret/errno/"filePath">
  */
 FILE *logF; // puntatore al file di log
 pthread_mutex_t logMutex = PTHREAD_MUTEX_INITIALIZER; // mutex per mutua esclusione sul file di log
@@ -116,17 +131,20 @@ pthread_mutex_t logMutex = PTHREAD_MUTEX_INITIALIZER; // mutex per mutua esclusi
  * 1 -> LRU
 */
 static int politic = 0;
+static int print = 0; //1->stampe attivate, 0->stampe disattivate
+
 static size_t maxStorageSize;    // dimensione massima dello storage (solo il contenuto dei file)
 static size_t maxNFile;      // numero massimo di files nello storage
 char socketName[MAXFILENAMELENGHT]; // nome socket
 static size_t nThread;    // numero di thread worker del server
+static long maxText;    //lunghezza massima testo file
 
 static hash *storage = NULL;    // tabella hash in cui saranno raccolti i files del server
 //non necessita di una mutex
 
 static priorityList* priorityQ = NULL;      //coda per la gestione della priorità di rimpiazzamento dei file
 pthread_mutex_t pqMutex = PTHREAD_MUTEX_INITIALIZER; // mutex coda priorityList
-//questa cosa di usa e si locka solo dentro una lock dei file, MAI il contrario
+//questa mutex si locka solo dentro (dopo) una lock dei file, MAI il contrario
 
 static clientList* clientQ = NULL;     // struttura dati di tipo coda FIFO per la comunicazione Master/Worker
 pthread_mutex_t cMutex = PTHREAD_MUTEX_INITIALIZER; // mutex per mutua esclusione sugli accessi alla coda
@@ -158,10 +176,11 @@ static size_t writeSucc = 0; //write terminate con successo
 static size_t totalWriteSize = 0; //dimensione totale delle scritture terminate con successo
 static size_t lockSucc = 0; //lock terminate con successo
 static size_t unlockSucc = 0; //numero di operazioni unlock terminate con successo
-static size_t openLockSucc = 0; //open con flag O_LOCK attivo terminate con successo
+static size_t openSucc = 0; //open con flag O_LOCK attivo terminate con successo
 static size_t closeSucc = 0; //close avvenute con successo
 static size_t maxConnReach = 0;   //numero massimo di connessioni contemporanee raggiunto
 static size_t currentConn = 0;   //numero di connessioni attuali
+static size_t removeSucc = 0;   //numero di removeFile
 
 //LOCK E UNLOCK CON GESTIONE ERRORI
 static void safeLock(pthread_mutex_t *mtx) {
@@ -170,7 +189,7 @@ static void safeLock(pthread_mutex_t *mtx) {
 }
 static void safeUnlock(pthread_mutex_t *mtx) {
     int err;
-    GESTERRI(err= pthread_mutex_unlock(mtx) != 0, errno = err; perror("unlock error"); pthread_exit((void *) errno);)
+    GESTERRI(err = pthread_mutex_unlock(mtx) != 0, errno = err; perror("unlock error"); pthread_exit((void *) errno);)
 }
 
 
@@ -420,25 +439,7 @@ static int clientListRemove(clientList* lst, int clientId) {
 
     return 0;
 }
-/*
-static void printClientList (clientList* lst){
 
-    if (lst == NULL){
-        errno = EINVAL;
-        safeUnlock(&pqMutex);
-        return;
-    }
-
-    printf("\nSTART QUEUE \n");
-    clientNode* cursor = lst->head;
-    while (cursor != NULL)
-    {
-        printf("%d||",cursor->clientId);
-        cursor = cursor->next;
-    }
-    printf("\nEND QUEUE \n");
-}
-*/
 //FUNZIONI PER LA GESTIONE DI FILE
 /**
  *   @brief Funzione che inizializza un file
@@ -617,7 +618,7 @@ static int pListRemove(priorityList *lst, char *path) {
     return 0;
 }
 
-
+/*///TOGLIERE
 static void printPQ (priorityList* lst)
 
 {
@@ -640,8 +641,7 @@ static void printPQ (priorityList* lst)
     printf("\nEND QUEUE \n");
 
     safeUnlock(&pqMutex);
-}
-
+}*/
 
 /**
  * @brief funzione che mantiene la politica LRU mettendo in testa un file appena utilizzato
@@ -699,6 +699,7 @@ static fileList *createFileList() {
  *   @brief Funzione che stampa una rappresentazione di una lista di files
  *   @param puntatore alla lista
  */
+/*//TOGLIERE
 static void printFileList(fileList *lst) {
 
     if (lst == NULL) printf("NULL\n");
@@ -713,7 +714,7 @@ static void printFileList(fileList *lst) {
         }
     }
     printf("END\n");
-}
+}*/
 
 /**
  *   @brief Funzione che restituisce il puntatore ad un file dentro alla lista con il path specificato
@@ -985,6 +986,7 @@ static fileList *hashTableGetFList(hash *ht, char *path) {
  *   @brief funzione che stampa la tabella hash ht
  *   @param ht puntatore alla tabella hash
 */
+/*///TOGLIERE
 static void printHashTable(hash *ht) {
     GESTERRP(ht, printf("NULL\n");)//non è un errore ma fa comodo
 
@@ -994,7 +996,7 @@ static void printHashTable(hash *ht) {
     for (i = 0; i < ht->size; i++) printFileList(ht->lists[i]);
 
     printf("END TABLE\n");
-}
+}*/
 
 /**
  *   @brief Funzione che controlla se un file è presente nella tabella passata come parametro
@@ -1259,6 +1261,10 @@ static int openFile(char *path, int flags, int clientId) {
                         return -1;
                     }
 
+                safeLock(&sMutex);
+                openSucc++;
+                safeUnlock(&sMutex);
+
                 //terminata con succeesso
                 safeUnlock(&(dummyL->mtx));
 
@@ -1274,11 +1280,6 @@ static int openFile(char *path, int flags, int clientId) {
             file *dummyF = hashTableGetFile(storage, path);
             GESTERRP(dummyF, safeUnlock(&(dummyL->mtx));perror("openFile");  return -1;)
 
-            safeLock(&sMutex);
-            openLockSucc++;
-            lockSucc++;
-            safeUnlock(&sMutex);
-
             if (dummyF->lockOwner == 0 || dummyF->lockOwner == clientId) {//successo
 
                 if(clientListContains(dummyF->openerList, clientId) == 0)
@@ -1287,6 +1288,10 @@ static int openFile(char *path, int flags, int clientId) {
                         safeUnlock(&(dummyL->mtx));
                         return -1;
                     }
+
+                safeLock(&sMutex);
+                openSucc++;
+                safeUnlock(&sMutex);
 
                 dummyF->lockOwner = clientId;
                 safeUnlock(&(dummyL->mtx));
@@ -1322,6 +1327,7 @@ static int openFile(char *path, int flags, int clientId) {
 
             safeLock(&sMutex);
             AGGMAX(currentNFile, maxNFileReach)
+            openSucc++;
             safeUnlock(&sMutex);
 
             safeUnlock(&dummyL->mtx);
@@ -1353,7 +1359,9 @@ static int openFile(char *path, int flags, int clientId) {
 
             safeLock(&sMutex);
             AGGMAX(currentNFile, maxNFileReach)
+            openSucc++;
             safeUnlock(&sMutex);
+
 
             safeUnlock(&dummyL->mtx);
             POLITIC(dummyF->fPointer)
@@ -1397,7 +1405,6 @@ static int readFile(char *path, char **buf, size_t *size, int clientId) {
             *size = strlen(dummyF->text) + 1;
 
             *buf = malloc(sizeof(char) * (*size));
-            printf("TESTO: %s\n", dummyF->text);
             strncpy(*buf, dummyF->text, (*size));
 
 
@@ -1676,6 +1683,9 @@ static int removeFile(char *path, int clientId) {
         if(dummyF->lockOwner == clientId){//rimozione solo se locked
 
             freeFile(hashTableRemovePath(storage, path));
+            safeLock(&sMutex);
+            removeSucc++;
+            safeUnlock(&sMutex);
 
             safeUnlock(&(dummyL->mtx));
 
@@ -1713,41 +1723,60 @@ static int sendNFile(fileList *fl, int N,  int clientId, int pipeFD, int *endFla
 
         if(curr == NULL){//errore
             sprintf(out, "END");
-            if (writen(clientId, out, STANDARDMSGSIZE) == -1) {//path + sizeText
+
+            if(writen(clientId, out, STANDARDMSGSIZE) == -1){
                 perror("executeTask:sendNFile");
                 *endFlag = 1;
+                hashResetLock(storage, clientId);
 
                 //USOPIPE
-                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,
                          errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
                 GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
                          errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
-                return -1;
+                         return -1;
             }
             return i;
         }
 
         textLen = strlen(curr->text) + 1;
-        sprintf(out, "%s;%d;", curr->path, textLen);
-        printf("SENDN: %s\n", out);
-
-        if (writen(clientId, out, STANDARDMSGSIZE) == -1) {//path + sizeText
+        sprintf(out, "%s|%d|", curr->path, textLen);
+        if(writen(clientId, out, STANDARDMSGSIZE) == -1){//scrittura
             perror("executeTask:sendNFile");
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,
                      errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
             GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
                      errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
             return -1;
         }
-        if (writen(clientId, curr->text, textLen) == -1) {//contenuto file
+
+        int pos = 0;
+        while(textLen - pos > BIGMSGSIZE){
+            if(writen(clientId, (curr->text) + pos, BIGMSGSIZE) == -1){
+                perror("executeTask:sendNFile");
+                *endFlag = 1;
+                hashResetLock(storage, clientId);
+
+                //USOPIPE
+                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,
+                         errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
+                GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
+                         errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
+                return -1;
+            }
+            pos += BIGMSGSIZE;
+        }
+        if(writen(clientId, (curr->text) + pos, textLen - pos) == -1){//scrittura
             perror("executeTask:sendNFile");
             *endFlag = 1;
+            hashResetLock(storage, clientId);
 
             //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
+            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,
                      errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
             GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
                      errno = EPIPE; perror("executeTask:sendNFile"); exit(EXIT_FAILURE);)
@@ -1781,37 +1810,26 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
     int ret;//valore di ritorno da mandare al client
     int errnoValue;// errno per il log
 
-    token = strtok_r(task, ";", &save);//tokenizzazione stringa che contiene la task, primo token = tipo di op
+    token = strtok_r(task, "|", &save);//tokenizzazione stringa che contiene la task, primo token = tipo di op
 
     //openfile
     if (strcmp(token, "3") == 0) {
-        //3;flags;pathname;
+        //3|flags|pathname|
 
         //flags
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
         int flags = (int) strtol(token, NULL, 10);
 
-        token = strtok_r(NULL, ";", &save);//il terminatore c'è per forza, se troppo lungo genera errore in seguito
+        token = strtok_r(NULL, "|", &save);//il terminatore c'è per forza, se troppo lungo genera errore in seguito
         //path
 
         ret = openFile(token, flags, clientId);
         errnoValue = errno;
 
-        if (ret == -1) sprintf(out, "-1;%d;", errno);
-        else sprintf(out, "0;");
+        if (ret == -1) sprintf(out, "-1|%d|", errno);
+        else sprintf(out, "0|");
 
-        if (writen(clientId, out, SMALLMSGSIZE) == -1) {//comunicazione con il client
-            perror("executeTask:openFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:openFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:openFile"); exit(EXIT_FAILURE);)
-            return;
-        }
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1, "executeTask:openFile")
 
         int o_create; int o_lock;//flag
         switch(flags){
@@ -1831,47 +1849,36 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         }
 
         //log
-        //[ThreadID]<3/ret/errno/O_CREATE/O_LOCK/"filePath">
+        //[ThreadID]<clientId/3/ret/errno/O_CREATE/O_LOCK/"filePath">
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<3/%d/%d/%d|%d/\"%s\">\n", pthread_self(), ret, errnoValue, o_create, o_lock, token);
+        fprintf(logF, "[%lu]<%d/3/%d/%d/%d|%d/\"%s\">\n", pthread_self(), clientId, ret, errnoValue, o_create, o_lock, token);
         safeUnlock(&logMutex);
     }
     //closeFile
     else if (strcmp(token, "10") == 0) {
-        //10;pathname;
+        //10|pathname|
 
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
 
         ret = closeFile(token, clientId);
         errnoValue = errno;
 
-        if (ret == -1) sprintf(out, "-1;%d;", errno);
-        else sprintf(out, "0;");
+        if (ret == -1) sprintf(out, "-1|%d|", errno);
+        else sprintf(out, "0|");
 
-        if(writen(clientId, out, SMALLMSGSIZE) == -1) {
-            perror("executeTask:closeFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:closeFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:closeFile"); exit(EXIT_FAILURE);)
-            return;
-        }
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1, "executeTask:closeFile")
 
         //log
-        //[ThreadID]<10/ret/errno/"filePath">
+        //[ThreadID]<clientId/10/ret/errno/"filePath">
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<10/%d/%d/\"%s\">\n", pthread_self(), ret, errnoValue, token);
+        fprintf(logF, "[%lu]<%d/10/%d/%d/\"%s\">\n", pthread_self(), clientId, ret, errnoValue, token);
         safeUnlock(&logMutex);
     }
     //lockFile
     else if (strcmp(token, "8") == 0) {
-        //8;pathname;
+        //8|pathname|
 
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
         ret = -2;
 
         safeLock(&lockFileMutex);
@@ -1885,188 +1892,138 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         }
         safeUnlock(&lockFileMutex);
 
-        if (ret == -1) sprintf(out, "-1;%d;", errno);
-        else sprintf(out, "0;");
+        if (ret == -1) sprintf(out, "-1|%d|", errno);
+        else sprintf(out, "0|");
 
-        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
-            perror("executeTask:lockFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:lockFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:lockFile"); exit(EXIT_FAILURE);)
-            return;
-        }
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1, "executeTask:lockFile")
 
         //log
-        //[Thrd_id]<8/ret/errno/"filePath">
+        //[Thrd_id]<clientId/8/ret/errno/"filePath">
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<8/%d/%d/\"%s\">\n", pthread_self(),ret,errnoValue, token);
+        fprintf(logF, "[%lu]<%d/8/%d/%d/\"%s\">\n", pthread_self(), clientId,ret,errnoValue, token);
         safeUnlock(&logMutex);
     }
     //unlockFile
     else if (strcmp(token, "9") == 0) {
-        //9;pathname;
+        //9|pathname|
 
         // tokenizzazione degli argomenti
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
 
         // esecuzione della richiesta
         ret = unlockFile(token, clientId);
         errnoValue = errno;
 
-        if (ret == -1) sprintf(out, "-1;%d;", errno);
-        else sprintf(out, "0;");
+        if (ret == -1) sprintf(out, "-1|%d|", errno);
+        else sprintf(out, "0|");
 
-        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:unlockFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:unlockFile"); exit(EXIT_FAILURE);)
-            return;
-        }
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1, "executeTask:unlockFile")
 
         //log
-        //[Thrd_id]<9/ret/errno/"filePath">
+        //[Thrd_id]<clientId/9/ret/errno/"filePath">
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<9/%d/%d/%s>\n", pthread_self(), ret, errnoValue, token);
+        fprintf(logF, "[%lu]<%d/9/%d/%d/%s>\n", pthread_self(), clientId, ret, errnoValue, token);
         safeUnlock(&logMutex);
     }
     //removeFile
     else if (strcmp(token, "11") == 0) {
-        //11;pathname;
+        //11|pathname|
 
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
 
         // esecuzione della richiesta
         ret = removeFile(token, clientId);
         errnoValue = errno;
 
-        if (ret == -1) sprintf(out, "-1;%d;", errno);
-        else sprintf(out, "0;");
+        if (ret == -1) sprintf(out, "-1|%d|", errno);
+        else sprintf(out, "0|");
 
-
-        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
-            perror("executeTask:removeFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:removeFile"); exit(EXIT_FAILURE);)
-            return;
-        }
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1, "executeTask:removeFile")
 
         //log
-        //[Thrd_id]<11/ret/errno/"filePath">
+        //[Thrd_id]<clientId/11/ret/errno/"filePath">
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<11/%d/%d/\"%s\">\n", pthread_self(), ret, errnoValue, token);
+        fprintf(logF, "[%lu]<%d/11/%d/%d/\"%s\">\n", pthread_self(), clientId, ret, errnoValue, token);
         safeUnlock(&logMutex);
     }
     //writeFile
     else if (strcmp(token, "6") == 0) {
-        //6;pathname;sizeText;
-        //prossimo messagio: text;
+        //6|pathname|sizeText|
+        //prossimo messagio: text|
 
         //pathname
         char *path;
-        path = strtok_r(NULL, ";", &save);
+        path = strtok_r(NULL, "|", &save);
 
         //dim testo (con terminatore)
         size_t sizeText;
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
         sizeText = (size_t) strtol(token, NULL, 10);
 
-        char text[sizeText];
+        char* text = malloc(sizeof(char) * sizeText);//buffer per il testo
 
-        if (readn(clientId, text, sizeText) == -1) {
-            perror("executeTask:writeFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:writeFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:writeFile"); exit(EXIT_FAILURE);)
-            return;
+        int pos = 0;
+        while(sizeText - pos > BIGMSGSIZE){
+            GESTERRPIPE(readn(clientId, (text + pos), BIGMSGSIZE) == -1, "executeTask:writeFile" )//ricezione
+            pos += BIGMSGSIZE;
         }
-        text[sizeText - 1] = '\0';
+        GESTERRPIPE(readn(clientId, (text + pos), (sizeText - pos)) == -1, "executeTask:writeFile" )//ricezione
+
+        text[sizeText - 1] = '\0';//serve??
 
         // esecuzione della richiesta
         fileList *dummyFileList = writeFile(path, text, clientId);
+        free(text);
+
         errnoValue = errno;
         size_t listSize = 0;
         if(dummyFileList != NULL) listSize = dummyFileList->size;
         if (errnoValue != 0){
             ret = -1;
-            sprintf(out, "-1;%d;%lu;", errno, listSize);
+            sprintf(out, "-1|%d|%lu|", errno, listSize);
         }
         else {
             ret = 0;
-            sprintf(out, "0;%lu;", listSize);
+            sprintf(out, "0|%lu|", listSize);
         }
 
-        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
-            perror("executeTask:writeFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:writeFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:writeFile"); exit(EXIT_FAILURE);)
-            return;
-        }
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1 , "executeTask:writeFile" )//ricezione 2.2
 
         if(listSize != 0)
             GESTERRI(sendNFile(dummyFileList, listSize, clientId, pipeFD, endFlag) == -1, freeFileList(dummyFileList);return;)//errore invio messaggi
 
         //log
-        //[Thrd_id]<6/ret/errno/"filePath"/listSize>
+        //[Thrd_id]<clientId/6/ret/errno/"filePath"/listSize>
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<6/%d/%d/\"%s\"/%lu>\n", pthread_self(), ret,errnoValue, token, listSize);
+        fprintf(logF, "[%lu]<%d/6/%d/%d/\"%s\"/%lu>\n", pthread_self(), clientId, ret,errnoValue, token, listSize);
         safeUnlock(&logMutex);
         freeFileList(dummyFileList);
     }
     //appendToFile
     else if (strcmp(token, "7") == 0) {
-        //7;pathname;sizeText;
-        //prossimo messagio: text;
+        //7|pathname|sizeText|
+        //prossimo messagio: text|
 
         //pathname
         char *path;
-        path = strtok_r(NULL, ";", &save);
+        path = strtok_r(NULL, "|", &save);
 
         //dim testo (con terminatore)
         size_t sizeText;
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
         sizeText = (size_t) strtol(token, NULL, 10);
 
         char text[sizeText];
 
-        if (readn(clientId, text, sizeText) == -1) {
-            perror("executeTask:appendToFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
 
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:appendToFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:appendToFile"); exit(EXIT_FAILURE);)
-            return;
+        int pos = 0;
+        while(sizeText - pos > BIGMSGSIZE){
+            GESTERRPIPE(readn(clientId, (text + pos), BIGMSGSIZE) == -1, "executeTask:appendToFile" )//ricezione 2.2
+            pos += BIGMSGSIZE;
         }
+        GESTERRPIPE(readn(clientId, (text + pos), (sizeText - pos)) == -1, "executeTask:appendToFile" )//ricezione 2.2
+
+
         text[sizeText - 1] = '\0';
 
         // esecuzione della richiesta
@@ -2076,41 +2033,30 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         if(dummyFileList != NULL) listSize = dummyFileList->size;
         if (errnoValue != 0){
             ret = -1;
-            sprintf(out, "-1;%d;%lu;", errno, listSize);
+            sprintf(out, "-1|%d|%lu|", errno, listSize);
         }
         else {
             ret = 0;
-            sprintf(out, "0;%lu;", listSize);
+            sprintf(out, "0|%lu|", listSize);
         }
 
-        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
-            perror("executeTask:appendToFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:appendToFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:appendToFile"); exit(EXIT_FAILURE);)
-            return;
-        }
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1, "executeTask:appendToFile")
 
         if(listSize != 0)
             GESTERRI(sendNFile(dummyFileList, listSize, clientId, pipeFD, endFlag) == -1, freeFileList(dummyFileList);return;)//errore invio messaggi
 
         //log
-        //[Thrd_id]<7/ret/errno/"filePath"/listSize>
+        //[Thrd_id]<clientId/7/ret/errno/"filePath"/listSize>
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<7/%d/%d/\"%s\"/%lu>\n", pthread_self(), ret,errnoValue, token, listSize);
+        fprintf(logF, "[%lu]<%d/7/%d/%d/\"%s\"/%lu>\n", pthread_self(), clientId, ret,errnoValue, token, listSize);
         safeUnlock(&logMutex);
         freeFileList(dummyFileList);
     }
     //readFile
     else if (strcmp(token, "4") == 0) {
-        //4;pathname;
+        //4|pathname|
 
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
 
         char *buffer;
         size_t size;
@@ -2119,51 +2065,36 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         errnoValue = errno;
 
         if (ret == -1){
-            sprintf(out, "-1;%d;", errno);
+            sprintf(out, "-1|%d|", errno);
             buffer = NULL;
             size = 0;
         }
-        else sprintf(out, "0;%lu;", size); //comando terminato correttamente, 0;dimensioneRead;
+        else sprintf(out, "0|%lu|", size); //comando terminato correttamente, 0;dimensioneRead;
 
-        if (writen(clientId, out, SMALLMSGSIZE) == -1) {//successo o fallimento
-            perror("executeTask:readFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1, "executeTask:readFile")//successo o fallimento
 
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:readFile"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:readeFile"); exit(EXIT_FAILURE);)
-            return;
+        if(ret != -1) {//contenuto file
+            int pos = 0;
+            while (size - pos > BIGMSGSIZE) {
+                GESTERRPIPE(writen(clientId, buffer + pos, BIGMSGSIZE) == -1, "executeTask:readFile")
+                pos += BIGMSGSIZE;
+            }
+            GESTERRPIPE(writen(clientId, buffer + pos, size - pos) == -1, "executeTask:readFile")
         }
-        if(ret != -1)
-            if (writen(clientId, buffer, size) == -1) {//se successo, scriviamo la lettura
-                perror("executeTask:readFile");
-                *endFlag = 1;
-                hashResetLock(storage, clientId);
-
-                //USOPIPE
-                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                         errno = EPIPE; perror("executeTask:readFile"); exit(EXIT_FAILURE);)
-                GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                         errno = EPIPE; perror("executeTask:readFile"); exit(EXIT_FAILURE);)
-                return;
-            }//contenuto file
 
         //log
-        //[Thrd_id]<4/ret/errno/"filePath"/readSize>
+        //[Thrd_id]<clientId/4/ret/errno/"filePath"/readSize>
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<4/%d/%d/\"%s\"/%lu>\n", pthread_self(), ret, errnoValue, token, size);
+        fprintf(logF, "[%lu]<%d/4/%d/%d/\"%s\"/%lu>\n", pthread_self(), clientId, ret, errnoValue, token, size);
         safeUnlock(&logMutex);
 
         free(buffer);
     }
     //readNFiles
     else if (strcmp(token, "5") == 0) {
-        //5;N;
+        //5|N|
 
-        token = strtok_r(NULL, ";", &save);
+        token = strtok_r(NULL, "|", &save);
         int N = (int) strtol(token, NULL, 10);
         int fileInviati = 0;
         int storageFinito = 0;
@@ -2189,30 +2120,20 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
         }
         if(storageFinito && fileInviati<N){//se N era 0 o troppo grande avvisiamo che non abbiamo altro da inviare
             char out2[STANDARDMSGSIZE] = "END";
-            if (writen(clientId, out2, STANDARDMSGSIZE) == -1) {//path + sizeText
-                perror("executeTask:readNFiles");
-                *endFlag = 1;
 
-                //USOPIPE
-                GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                         errno = EPIPE; perror("executeTask:readNFiles"); exit(EXIT_FAILURE);)
-                GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                         errno = EPIPE; perror("executeTask:readNFiles"); exit(EXIT_FAILURE);)
-                return;
-            }
+            GESTERRPIPE(writen(clientId, out2, STANDARDMSGSIZE) == -1, "executeTask:readNFiles")
         }
 
 
         //log
-        //[Thrd_id]<5/0/fileInviati>
+        //[Thrd_id]<clientId/5/0/fileInviati>
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<5/0/%d>", pthread_self(), fileInviati);
+        fprintf(logF, "[%lu]<%d/5/0/%d>\n", pthread_self(), clientId, fileInviati);
         safeUnlock(&logMutex);
     }
     //closeConnection
     else if (strcmp(token, "2") == 0) {//disconnect
         hashResetLock(storage, clientId);
-
         *endFlag = 1;//disconnesso, cambiare client
 
         GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
@@ -2221,30 +2142,23 @@ static void executeTask(char *task, int clientId, int pipeFD, int *endFlag) {
                  errno = EPIPE; perror("executeTask:closeConnection"); exit(EXIT_FAILURE);)
 
         //log
-        //[Thrd_id]<2/clientId>
+        //[Thrd_id]<clientId/2>
         safeLock(&logMutex);
-        fprintf(logF, "[%lu]<2/clientId>", pthread_self());
+        fprintf(logF, "[%lu]<%d/2>\n", pthread_self(), clientId);
         safeUnlock(&logMutex);
     }
     //default
     else {
         //funzione non implementata
-        sprintf(out, "-1;%d", ENOSYS);
+        sprintf(out, "-1|%d|", ENOSYS);
 
-        if (writen(clientId, out, SMALLMSGSIZE) == -1) {
-            perror("executeTask:writeFile");
-            *endFlag = 1;
-            hashResetLock(storage, clientId);
-            //USOPIPE
-            GESTERRI(write(pipeFD, &clientId, sizeof(clientId)) == -1,//scrittura nella pipe per comunicare con il server stesso
-                     errno = EPIPE; perror("executeTask:default"); exit(EXIT_FAILURE);)
-            GESTERRI(write(pipeFD, endFlag, sizeof(*endFlag)) == -1,
-                     errno = EPIPE; perror("executeTask:default"); exit(EXIT_FAILURE);)
-            return;
-        }
+        GESTERRPIPE(writen(clientId, out, SMALLMSGSIZE) == -1,"executeTask:default")
     }
 }
-
+/**
+ *   @brief Funzione eseguita dai worker che aspettano e gestiscono richieste dei client
+ *   @param arg richiesta del client da eseguire
+ */
 static void *workerRoutine(void *arg) {
     //indirizzo pipe passato
     int pipeFD = *((int *) arg);
@@ -2256,7 +2170,7 @@ static void *workerRoutine(void *arg) {
 
         //un client viene espulso dalla coda secondo la politica priorityList
         clientId = clientListPop(clientQ);
-        printf("CLIENTID: %d\n", clientId);
+
 
         //interruzione
         if (clientId == -2) return (void *) -1;
@@ -2267,9 +2181,8 @@ static void *workerRoutine(void *arg) {
             memset(task, 0, STANDARDMSGSIZE);
 
             ret = readn(clientId, task, STANDARDMSGSIZE);
-            //quest[STANDARDMSGSIZE - 1] = '\0';//legale??
 
-            if (ret == -1) {//client disconnesso, return thread si libera
+            if (ret == -1 || strcmp(task, "") == 0 || task == NULL) {//client disconnesso, return thread si libera
                 end = 1;//disconnesso, cambiare client
                 hashResetLock(storage, clientId);
 
@@ -2280,7 +2193,9 @@ static void *workerRoutine(void *arg) {
                          errno = EPIPE; perror("routine"); exit(EXIT_FAILURE);)
             }
             else {//eseguiamo il primo comando del client
-                printf("RICHIESTA: %s\n", task);
+
+                //TOGLIERE
+                PRINT(printf("CLIENTID: %d\nRICHIESTA <%s>\n", clientId, task);)
                 executeTask(task, clientId, pipeFD, &end);
             }
         }
@@ -2340,9 +2255,9 @@ void parseConfig(char* pathConfig){
     //int defConfig = 0;
 
     //valori server standard
-    maxNFile = 100;
-    maxStorageSize = 1048576;
-    nThread = 5;
+    maxNFile = 1000;
+    maxStorageSize = 1024*1024*65; //65MB
+    nThread = 8;
     strcpy(socketName, SOCKET);
 
     if(pathConfig != NULL) {
@@ -2400,6 +2315,12 @@ void parseConfig(char* pathConfig){
                             else if (strcmp(valore, "LRU") == 0) politic = 1;
                                 else printf("Formato linea %d non corretto\n", linea);
                         }
+                        else if (strcmp(parametro, "print") == 0) {//politica dello storage
+
+                            if (strcmp(valore, "YES") == 0) print = 1;
+                            else if (strcmp(valore, "NO") == 0) print = 0;
+                            else printf("Formato linea %d non corretto\n", linea);
+                        }
                         else printf("Formato linea %d non corretto\n", linea);
                     }
                 }
@@ -2409,16 +2330,18 @@ void parseConfig(char* pathConfig){
         }
     }
 
-    printf("PARAMETRI DEL SERVER\n");
+    PRINT(printf("PARAMETRI DEL SERVER\n");
     printf("  Nome socket: \"%s\"\n  Numero thread: %lu\n  Numero max File: %lu\n  Dimensione max server: %lu\n  Dimensione massima file: %lu\n  Politica: %d\n",
-           socketName, nThread, maxNFile, maxStorageSize, MAXTEXTLENGHT,  politic);
+           socketName, nThread, maxNFile, maxStorageSize, MAXTEXTLENGHT,  politic);)
     return;
 }
-
+/**
+ *   @brief Funzione main che inizializza le strutture dati, i worker e gesisce le richieste dei client e la terminazione del server
+*/
 int main(int argc, char *argv[]) {
 
     // argv[0] server.c | argv[1] config.txt_path | ... | argv[argc] NULL
-    printf("Inizio avvio server\n");
+    PRINT(printf("Inizio avvio server\n");)
     int dummyRet;
     int i; //utile per i cicli for
     int t_soft = 0;
@@ -2432,12 +2355,13 @@ int main(int argc, char *argv[]) {
 
     parseConfig(pathConfig);//configurazione valori server
     gestSig();//gestione segnali e handler, segnali memorizzati nella variabile t
+    maxText = (maxStorageSize/2) - ((maxStorageSize/2) % BIGMSGSIZE);// dimensione massima testo file, multiplo di BIGMSGSIZE
 
     //strutture dati
     clientQ = createClientList();//coda richieste clienti
     GESTERRP(clientQ, perror("creazione coda client"); exit(EXIT_FAILURE);)
 
-    storage = createHash(maxNFile/5);//hash table
+    storage = createHash(maxNFile/5 + 1);//hash table
     GESTERRP(storage, perror("creazione hashTable"); exit(EXIT_FAILURE);)
 
     priorityQ = createPriorityList();//lista priorità di rimpiazzamento
@@ -2503,7 +2427,7 @@ int main(int argc, char *argv[]) {
     fflush(logF);   //ripulisco il file
 
     //inizio ricezione richieste dei client
-    printf("Server avviato, attesa richieste...\n");
+    PRINT(printf("Server avviato, attesa richieste...\n");)
     while (1) {
 
         rd_set = set;//ripristino il set di partenza
@@ -2512,7 +2436,7 @@ int main(int argc, char *argv[]) {
             else if (t == 2) { //chiusura soft
                 if (currentConn == 0) break;
                 else {
-                    printf("Chiusura Soft\n");
+                    PRINT(printf("Chiusura Soft\n");)
                     FD_CLR(socketFD, &set);//rimozione del fd del socket dal set, non accetteremo altre connessioni
                     if (socketFD == fd_num) fd_num = max_up(set, fd_num);//aggiorno l'indice massimo
                     close(socketFD);//chiusura del socket
@@ -2542,7 +2466,13 @@ int main(int argc, char *argv[]) {
                             perror("Errore dell' accept");
                         }
                     }
-                    printf("accettata connessione\n");
+                    PRINT(printf("accettata connessione\n");)
+
+                    //comunichiamo la grandezza massima dei file
+                    char dim[SMALLMSGSIZE] = "";
+                    sprintf(dim, "%lu;", MAXTEXTLENGHT);
+                    GESTERRI(writen(clientFD, dim, SMALLMSGSIZE) == -1, perror("openConnection"); continue;)
+
                     FD_SET(clientFD, &set);//il file del client è pronto in lettura
 
                     //tengo aggiornato l'indice massimo
@@ -2554,7 +2484,7 @@ int main(int argc, char *argv[]) {
                     safeUnlock(&sMutex);
                     //printf ("SERVER : Connessione con il Client completata\n");
                 }
-                else if (dummyFD == pip[0]) {// il client è pronto in lettura
+                else if (dummyFD == pip[0]) {// il client è pronto in lettura, lo passiamo ad un worker
                     int fd_c1;
                     int l;
                     int flag;
@@ -2571,7 +2501,7 @@ int main(int argc, char *argv[]) {
                             close(fd_c1);//chiusura del client
                             currentConn--;//aggiornamento delle variabili per le statistiche
                             if (t == 2 && currentConn == 0) {
-                                printf("Terminazione Soft\n");
+                                PRINT(printf("Terminazione Soft\n");)
                                 t_soft = 1;
                                 break;
                             }
@@ -2585,7 +2515,8 @@ int main(int argc, char *argv[]) {
                     }
                 } else {
                     //il fd individuato è quello del canale di comunicazione client/server
-                    //il client è pronto in lettura
+                    //il client è connesso
+
                     safeLock(&cMutex);
                     clientListAddH(clientQ, dummyFD);
                     pthread_cond_signal(&condCoda);
@@ -2594,7 +2525,7 @@ int main(int argc, char *argv[]) {
                     //log
                     //[Thrd_id]<1/clientFD>
                     safeLock(&logMutex);
-                    fprintf(logF, "[%lu]<1/%d>", pthread_self(), dummyFD);
+                    fprintf(logF, "[%lu]<%d/1>\n", pthread_self(), dummyFD);
                     safeUnlock(&logMutex);
 
                     FD_CLR(dummyFD, &set);
@@ -2608,7 +2539,7 @@ int main(int argc, char *argv[]) {
     //////////////////////////////////// FINE FARE
 
 
-    printf("\nChiusura del Server...\n");
+    PRINT(printf("\nChiusura del Server...\n");)
 
     safeLock(&cMutex);
     for (i = 0; i < nThread; i++) {
@@ -2634,27 +2565,23 @@ int main(int argc, char *argv[]) {
     if(writeSucc != 0) mediaWriteSize = totalWriteSize / writeSucc;
 
     //chiusura file di log
-    fprintf(logF, "END\n");
-    fprintf(logF, "SUNTO DELLE STATISTICHE:\n");
-    fprintf(logF, "Numero di write: %lu;\nSize media delle scritture: %lu;\nNumero di read: %lu;\nSize media delle letture: %lu;\n"
-                  "Numero di openlock: %lu;\nNumero di lock: %lu;\nNumero di unlock: %lu;\nNumero di close: %lu;\n"
-                  "Dimensione massima dello storage: %lu;\nnumero di file massimo: %lu;\nNumero di replace: %lu;\n"
-                  "Massimo numero di connessioni contemporanee: %lu;\n",
-             writeSucc, mediaWriteSize, readSucc, mediaReadSize, openLockSucc, lockSucc, unlockSucc, closeSucc,
-            maxStorageSizeReach, maxNFileReach, replaceSucc, maxConnReach);
+    fprintf(logF, "\n==================================================================================================================================="
+                  "\nSUNTO DELLE STATISTICHE:\n");
+    fprintf(logF, "Numero di write: %lu\nSize media delle scritture: %lu\nNumero di read: %lu\nSize media delle letture: %lu\n"
+                  "Numero di open file: %lu\nNumero di lock: %lu\nNumero di unlock: %lu\nNumero di close: %lu\nNumero di remove: %lu\n"
+                  "Dimensione massima dello storage: %lu (MB)\nNumero di file massimo: %lu\nNumero di replace: %lu\n"
+                  "Massimo numero di connessioni contemporanee: %lu\n",
+             writeSucc, mediaWriteSize, readSucc, mediaReadSize, openSucc, lockSucc, unlockSucc, closeSucc, removeSucc,
+            maxStorageSizeReach/(1024*1024) + 1, maxNFileReach, replaceSucc, maxConnReach);
 
     //print andamento del server
+    PRINT(
     printf("SERVER INFO:\n");
-    printf("Numero Massimo di files : %lu\n", maxNFileReach);
-    printf("Dimensione Massima raggiunta (MB): %lu\n", maxStorageSizeReach/(1024*1024));
-    printf("Dimensione media delle read: %lu\n", mediaReadSize);
-    printf("Dimensione media delle write: %lu\n", mediaWriteSize);
-    printf("Attivazioni algoritmo di replace: %lu\n", replaceAtt);
-    printf("Numero di files rimossi per rimpiazzamento: %lu\n\n", replaceSucc);
-    printf("HASH TABLE:\n");
-    printHashTable(storage);
-    printf("PRIORITA' RIMPIAZZAMENTO:\n");
-    printPQ(priorityQ);
+    printf("Numero massimo di files raggiunto:\t%lu\n", maxNFileReach);
+    printf("Dimensione massima raggiunta:\t\t%lu (MB)\t\t%lu (B)\n", maxStorageSizeReach/(1024*1024) + 1, maxStorageSizeReach);
+    printf("Numero read e dimensione media:\t\t%lu\t\t%lu (B)\n", readSucc, mediaReadSize);
+    printf("Dimensione media delle write:\t\t%lu\t\t%lu (B)\n", writeSucc, mediaWriteSize);
+    printf("Numero di files espulsi:\t\t%lu\n\n", replaceSucc);)
 
     //free finali
     freeHashTable(storage);
