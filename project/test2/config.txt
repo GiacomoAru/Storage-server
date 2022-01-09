@@ -1,6 +1,0 @@
-nThread=4
-socketName=ssocket.sk
-maxNFile=10
-maxStorageSize=1048576
-politic=LRU
-print=YES
