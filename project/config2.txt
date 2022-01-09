@@ -1,0 +1,6 @@
+nThread=5
+socketName=ssocket.sk
+maxNFile=50
+maxStorageSize=35000
+politic=FIFO
+print=NO

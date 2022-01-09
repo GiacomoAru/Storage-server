@@ -1,0 +1,6 @@
+nThread=8
+socketName=ssocket.sk
+maxNFile=100
+maxStorageSize=33554432
+politic=LRU
+print=YES
